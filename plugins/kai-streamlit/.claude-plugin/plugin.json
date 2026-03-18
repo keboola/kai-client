@@ -1,0 +1,5 @@
+{
+  "name": "kai-streamlit",
+  "version": "1.0.0",
+  "description": "Claude Code plugin providing guidance for building Streamlit data apps that integrate with the Keboola AI Assistant (Kai) via the KaiClient Python library"
+}
