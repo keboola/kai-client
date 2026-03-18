@@ -519,7 +519,7 @@ Download the plugin to your Claude Code plugins directory:
 mkdir -p ~/.claude/plugins
 
 # Download the plugin using curl
-curl -L https://github.com/jordanrburger/kai-client/archive/refs/heads/main.tar.gz | \
+curl -L https://github.com/keboola/kai-client/archive/refs/heads/main.tar.gz | \
   tar -xz --strip-components=2 -C ~/.claude/plugins kai-client-main/plugins/kai-cli
 ```
 
@@ -527,7 +527,7 @@ Or using wget:
 
 ```bash
 mkdir -p ~/.claude/plugins
-wget -qO- https://github.com/jordanrburger/kai-client/archive/refs/heads/main.tar.gz | \
+wget -qO- https://github.com/keboola/kai-client/archive/refs/heads/main.tar.gz | \
   tar -xz --strip-components=2 -C ~/.claude/plugins kai-client-main/plugins/kai-cli
 ```
 
@@ -535,7 +535,7 @@ wget -qO- https://github.com/jordanrburger/kai-client/archive/refs/heads/main.ta
 
 ```bash
 # Clone the repository
-git clone https://github.com/jordanrburger/kai-client.git
+git clone https://github.com/keboola/kai-client.git
 cd kai-client
 
 # Option A: Run Claude Code with the plugin directory
