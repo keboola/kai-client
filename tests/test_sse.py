@@ -1,18 +1,25 @@
 """Tests for SSE stream parser."""
 
+import json
+from unittest.mock import AsyncMock
 
+import httpx
+import pytest
+
+from kai_client.exceptions import KaiStreamError
 from kai_client.models import (
     ErrorEvent,
     FinishEvent,
     StepStartEvent,
     TextEvent,
+    ToolApprovalRequestEvent,
     ToolCallEvent,
     ToolOutputErrorEvent,
     UnknownEvent,
     UsageEvent,
     UsageInfo,
 )
-from kai_client.sse import SSEStreamParser, parse_sse_event
+from kai_client.sse import SSEStreamParser, parse_sse_event, parse_sse_stream
 
 
 class TestParseSSEEvent:
@@ -681,5 +688,311 @@ class TestSSEStreamParser:
         assert parser.tool_calls["call-1"].output == {"tables": ["users", "orders"]}
         assert parser.finished is True
         assert parser.finish_reason == "stop"
+
+
+class TestToolApprovalEvents:
+    """Tests for tool approval event parsing."""
+
+    def test_parse_tool_approval_request_event(self):
+        """Test parsing tool-approval-request event."""
+        data = {
+            "type": "tool-approval-request",
+            "approvalId": "approval-abc-123",
+            "toolCallId": "call-456",
+        }
+        event = parse_sse_event(data)
+        assert isinstance(event, ToolApprovalRequestEvent)
+        assert event.type == "tool-approval-request"
+        assert event.approval_id == "approval-abc-123"
+        assert event.tool_call_id == "call-456"
+
+    def test_parse_tool_approval_request_minimal(self):
+        """Test parsing tool-approval-request with minimal data."""
+        data = {"type": "tool-approval-request"}
+        event = parse_sse_event(data)
+        assert isinstance(event, ToolApprovalRequestEvent)
+        assert event.approval_id == ""
+        assert event.tool_call_id == ""
+
+    def test_parse_tool_call_with_approval(self):
+        """Test tool-input-available with approval metadata."""
+        data = {
+            "type": "tool-input-available",
+            "toolCallId": "call-789",
+            "toolName": "update_descriptions",
+            "input": {"descriptions": "new desc"},
+            "approval": {
+                "id": "appr-xyz",
+                "approved": None,
+            },
+        }
+        event = parse_sse_event(data)
+        assert isinstance(event, ToolCallEvent)
+        assert event.approval is not None
+        assert event.approval.id == "appr-xyz"
+        assert event.approval.approved is None
+
+    def test_parse_tool_call_with_approval_approved(self):
+        """Test tool call with approval that has been approved."""
+        data = {
+            "type": "tool-call",
+            "toolCallId": "call-100",
+            "toolName": "create_config",
+            "state": "output-available",
+            "approval": {
+                "id": "appr-100",
+                "approved": True,
+                "reason": "User approved",
+            },
+        }
+        event = parse_sse_event(data)
+        assert isinstance(event, ToolCallEvent)
+        assert event.approval is not None
+        assert event.approval.approved is True
+        assert event.approval.reason == "User approved"
+
+    def test_parse_tool_call_with_empty_approval(self):
+        """Test tool call with empty approval dict (no id)."""
+        data = {
+            "type": "tool-call",
+            "toolCallId": "call-200",
+            "toolName": "get_tables",
+            "state": "started",
+            "approval": {},  # Empty — should result in None
+        }
+        event = parse_sse_event(data)
+        assert isinstance(event, ToolCallEvent)
+        assert event.approval is None
+
+
+class TestParseSSEStream:
+    """Tests for the parse_sse_stream async generator."""
+
+    @pytest.mark.asyncio
+    async def test_parse_basic_stream(self):
+        """Test parsing a basic SSE stream."""
+        lines = [
+            'data: {"type":"text","text":"Hello"}',
+            'data: {"type":"finish","finishReason":"stop"}',
+        ]
+
+        response = AsyncMock(spec=httpx.Response)
+        response.aiter_lines = self._make_async_iter(lines)
+
+        events = [event async for event in parse_sse_stream(response)]
+        assert len(events) == 2
+        assert events[0].type == "text"
+        assert events[0].text == "Hello"
+        assert events[1].type == "finish"
+
+    @pytest.mark.asyncio
+    async def test_parse_stream_skips_empty_lines(self):
+        """Test that empty lines are skipped."""
+        lines = [
+            "",
+            'data: {"type":"text","text":"Hello"}',
+            "",
+            "",
+            'data: {"type":"finish","finishReason":"stop"}',
+        ]
+
+        response = AsyncMock(spec=httpx.Response)
+        response.aiter_lines = self._make_async_iter(lines)
+
+        events = [event async for event in parse_sse_stream(response)]
+        assert len(events) == 2
+
+    @pytest.mark.asyncio
+    async def test_parse_stream_skips_comments(self):
+        """Test that SSE comments (lines starting with :) are skipped."""
+        lines = [
+            ": this is a comment",
+            'data: {"type":"text","text":"Hello"}',
+            ": another comment",
+            'data: {"type":"finish","finishReason":"stop"}',
+        ]
+
+        response = AsyncMock(spec=httpx.Response)
+        response.aiter_lines = self._make_async_iter(lines)
+
+        events = [event async for event in parse_sse_stream(response)]
+        assert len(events) == 2
+
+    @pytest.mark.asyncio
+    async def test_parse_stream_skips_empty_data(self):
+        """Test that empty data lines are skipped."""
+        lines = [
+            "data: ",
+            "data:   ",
+            'data: {"type":"text","text":"Hello"}',
+            'data: {"type":"finish","finishReason":"stop"}',
+        ]
+
+        response = AsyncMock(spec=httpx.Response)
+        response.aiter_lines = self._make_async_iter(lines)
+
+        events = [event async for event in parse_sse_stream(response)]
+        assert len(events) == 2
+
+    @pytest.mark.asyncio
+    async def test_parse_stream_handles_done_marker(self):
+        """Test that [DONE] termination marker is skipped."""
+        lines = [
+            'data: {"type":"text","text":"Hello"}',
+            'data: {"type":"finish","finishReason":"stop"}',
+            "data: [DONE]",
+        ]
+
+        response = AsyncMock(spec=httpx.Response)
+        response.aiter_lines = self._make_async_iter(lines)
+
+        events = [event async for event in parse_sse_stream(response)]
+        assert len(events) == 2
+
+    @pytest.mark.asyncio
+    async def test_parse_stream_ignores_event_field(self):
+        """Test that 'event:' lines are ignored without error."""
+        lines = [
+            "event: message",
+            'data: {"type":"text","text":"Hello"}',
+            'data: {"type":"finish","finishReason":"stop"}',
+        ]
+
+        response = AsyncMock(spec=httpx.Response)
+        response.aiter_lines = self._make_async_iter(lines)
+
+        events = [event async for event in parse_sse_stream(response)]
+        assert len(events) == 2
+
+    @pytest.mark.asyncio
+    async def test_parse_stream_ignores_id_field(self):
+        """Test that 'id:' lines are ignored without error."""
+        lines = [
+            "id: 12345",
+            'data: {"type":"text","text":"Hello"}',
+            'data: {"type":"finish","finishReason":"stop"}',
+        ]
+
+        response = AsyncMock(spec=httpx.Response)
+        response.aiter_lines = self._make_async_iter(lines)
+
+        events = [event async for event in parse_sse_stream(response)]
+        assert len(events) == 2
+
+    @pytest.mark.asyncio
+    async def test_parse_stream_ignores_retry_field(self):
+        """Test that 'retry:' lines are ignored without error."""
+        lines = [
+            "retry: 3000",
+            'data: {"type":"text","text":"Hello"}',
+            'data: {"type":"finish","finishReason":"stop"}',
+        ]
+
+        response = AsyncMock(spec=httpx.Response)
+        response.aiter_lines = self._make_async_iter(lines)
+
+        events = [event async for event in parse_sse_stream(response)]
+        assert len(events) == 2
+
+    @pytest.mark.asyncio
+    async def test_parse_stream_json_decode_error(self):
+        """Test that invalid JSON raises KaiStreamError."""
+        lines = [
+            "data: {invalid json}",
+        ]
+
+        response = AsyncMock(spec=httpx.Response)
+        response.aiter_lines = self._make_async_iter(lines)
+
+        with pytest.raises(KaiStreamError) as exc_info:
+            async for _ in parse_sse_stream(response):
+                pass
+
+        assert "Failed to parse SSE event" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_parse_stream_handles_stream_closed(self):
+        """Test graceful handling of StreamClosed."""
+
+        async def _iter_lines():
+            yield 'data: {"type":"text","text":"Hello"}'
+            raise httpx.StreamClosed()
+
+        response = AsyncMock(spec=httpx.Response)
+        response.aiter_lines = _iter_lines
+
+        events = [event async for event in parse_sse_stream(response)]
+        assert len(events) == 1
+        assert events[0].text == "Hello"
+
+    @pytest.mark.asyncio
+    async def test_parse_stream_handles_remote_protocol_error(self):
+        """Test KaiStreamError on RemoteProtocolError."""
+
+        async def _iter_lines():
+            yield 'data: {"type":"text","text":"Hello"}'
+            raise httpx.RemoteProtocolError("Connection reset")
+
+        response = AsyncMock(spec=httpx.Response)
+        response.aiter_lines = _iter_lines
+
+        with pytest.raises(KaiStreamError) as exc_info:
+            async for _ in parse_sse_stream(response):
+                pass
+
+        assert "Connection error during streaming" in str(exc_info.value)
+
+    @staticmethod
+    def _make_async_iter(lines):
+        """Create an async iterator function from a list of lines."""
+
+        async def _aiter():
+            for line in lines:
+                yield line
+
+        return _aiter
+
+
+class TestSSEStreamParserConsumeStream:
+    """Tests for SSEStreamParser.consume_stream method."""
+
+    @pytest.mark.asyncio
+    async def test_consume_stream_yields_events(self):
+        """Test consume_stream yields and processes events."""
+        lines = [
+            'data: {"type":"text","text":"Hello"}',
+            'data: {"type":"text","text":" world"}',
+            'data: {"type":"finish","finishReason":"stop"}',
+        ]
+
+        response = AsyncMock(spec=httpx.Response)
+        response.aiter_lines = TestParseSSEStream._make_async_iter(lines)
+
+        parser = SSEStreamParser()
+        events = [event async for event in parser.consume_stream(response)]
+
+        assert len(events) == 3
+        assert parser.text == "Hello world"
+        assert parser.finished is True
+
+    @pytest.mark.asyncio
+    async def test_consume_stream_no_yield(self):
+        """Test consume_stream with yield_events=False."""
+        lines = [
+            'data: {"type":"text","text":"Hello"}',
+            'data: {"type":"finish","finishReason":"stop"}',
+        ]
+
+        response = AsyncMock(spec=httpx.Response)
+        response.aiter_lines = TestParseSSEStream._make_async_iter(lines)
+
+        parser = SSEStreamParser()
+        events = [
+            event async for event in parser.consume_stream(response, yield_events=False)
+        ]
+
+        assert len(events) == 0  # No events yielded
+        assert parser.text == "Hello"  # But state was still updated
+        assert parser.finished is True
 
 
