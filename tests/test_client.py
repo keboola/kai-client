@@ -1532,3 +1532,504 @@ class TestAllBackendTools:
             assert pending_tools[0].input is not None
 
 
+class TestFromStorageApiConnectionError:
+    """Tests for from_storage_api when connection fails."""
+
+    @pytest.mark.asyncio
+    async def test_from_storage_api_connection_error(self, httpx_mock: HTTPXMock):
+        """Test error when Storage API is unreachable."""
+        import httpx as httpx_lib
+
+        from kai_client import KaiConnectionError
+
+        httpx_mock.add_exception(
+            httpx_lib.RequestError("Connection refused"),
+            url="https://connection.keboola.com/v2/storage",
+        )
+
+        with pytest.raises(KaiConnectionError) as exc_info:
+            await KaiClient.from_storage_api(
+                storage_api_token="test-token",
+                storage_api_url="https://connection.keboola.com",
+            )
+
+        assert "Failed to connect to Storage API" in str(exc_info.value)
+
+
+class TestLazyClientInit:
+    """Tests for lazy client initialization (without context manager)."""
+
+    @pytest.mark.asyncio
+    async def test_get_client_creates_client_lazily(self, httpx_mock: HTTPXMock):
+        """Test that _get_client creates client on first use."""
+        httpx_mock.add_response(
+            url="http://localhost:3000/ping",
+            json={"timestamp": "2025-12-24T16:24:10.641Z"},
+        )
+
+        client = KaiClient(
+            storage_api_token="token",
+            storage_api_url="https://connection.keboola.com",
+        )
+
+        # No context manager — lazy init
+        assert client._client is None
+        await client.ping()
+        assert client._client is not None
+        await client.close()
+
+
+class TestNonJsonHttpError:
+    """Tests for HTTP errors with non-JSON response bodies."""
+
+    @pytest.mark.asyncio
+    async def test_non_json_error_response(self, client: KaiClient, httpx_mock: HTTPXMock):
+        """Test _request when server returns non-JSON error body."""
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/chat/chat-123",
+            status_code=502,
+            content=b"Bad Gateway",
+        )
+
+        async with client:
+            with pytest.raises(KaiError) as exc_info:
+                await client.get_chat("chat-123")
+
+        assert "502" in str(exc_info.value)
+        assert exc_info.value.code == "http:502"
+
+
+class TestStreamRequestErrorEdgeCases:
+    """Tests for _stream_request error handling edge cases."""
+
+    @pytest.mark.asyncio
+    async def test_stream_error_empty_body_uses_reason_phrase(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        """Test streaming error with empty body falls back to reason phrase."""
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/chat",
+            method="POST",
+            status_code=503,
+            content=b"",
+        )
+
+        async with client:
+            with pytest.raises(KaiError) as exc_info:
+                async for _ in client.send_message("chat-123", "Test"):
+                    pass
+
+        assert "503" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_stream_error_non_json_body(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        """Test streaming error with non-JSON body that starts with '{'."""
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/chat",
+            method="POST",
+            status_code=500,
+            content=b"{broken json",
+        )
+
+        async with client:
+            with pytest.raises(KaiError) as exc_info:
+                async for _ in client.send_message("chat-123", "Test"):
+                    pass
+
+        assert "500" in str(exc_info.value)
+
+
+class TestV6ToolApprovalFlow:
+    """Tests for the Vercel AI SDK v6 tool approval flow."""
+
+    @pytest.mark.asyncio
+    async def test_send_tool_approval_response_approve(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        """Test approving a tool via the v6 flow."""
+        # Mock get_chat to return assistant message with pending approval
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/chat/chat-123",
+            json={
+                "id": "chat-123",
+                "messages": [
+                    {
+                        "id": "msg-user",
+                        "role": "user",
+                        "parts": [{"type": "text", "text": "Update descriptions"}],
+                    },
+                    {
+                        "id": "msg-assistant",
+                        "role": "assistant",
+                        "parts": [
+                            {"type": "text", "text": "I'll update the descriptions."},
+                            {
+                                "type": "tool-update_descriptions",
+                                "toolCallId": "call-001",
+                                "state": "approval-required",
+                                "approval": {
+                                    "id": "approval-abc",
+                                    "approved": None,
+                                },
+                                "input": {"descriptions": "new desc"},
+                            },
+                        ],
+                    },
+                ],
+            },
+        )
+
+        # Mock the streaming response after approval
+        sse_response = (
+            'data: {"type":"text","text":"Descriptions updated."}\n'
+            'data: {"type":"finish","finishReason":"stop"}\n'
+        )
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/chat",
+            method="POST",
+            content=sse_response.encode(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        async with client:
+            events = []
+            async for event in client.send_tool_approval_response(
+                chat_id="chat-123",
+                approval_id="approval-abc",
+                approved=True,
+            ):
+                events.append(event)
+
+        assert len(events) == 2
+        assert events[0].type == "text"
+        assert events[0].text == "Descriptions updated."
+
+        # Verify the POST payload has the updated assistant message
+        requests = httpx_mock.get_requests()
+        post_request = [r for r in requests if r.method == "POST"][0]
+        body = json.loads(post_request.content)
+        assert body["id"] == "chat-123"
+        assert body["message"]["id"] == "msg-assistant"
+        assert body["message"]["role"] == "assistant"
+
+        # Find the updated tool part
+        tool_parts = [p for p in body["message"]["parts"] if "approval" in p]
+        assert len(tool_parts) == 1
+        assert tool_parts[0]["state"] == "approval-responded"
+        assert tool_parts[0]["approval"]["approved"] is True
+
+    @pytest.mark.asyncio
+    async def test_send_tool_approval_response_reject_with_reason(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        """Test rejecting a tool with a reason via the v6 flow."""
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/chat/chat-123",
+            json={
+                "id": "chat-123",
+                "messages": [
+                    {
+                        "id": "msg-assistant",
+                        "role": "assistant",
+                        "parts": [
+                            {
+                                "type": "tool-delete_bucket",
+                                "toolCallId": "call-002",
+                                "state": "approval-required",
+                                "approval": {"id": "approval-def"},
+                                "input": {"bucket_id": "in.c-test"},
+                            },
+                        ],
+                    },
+                ],
+            },
+        )
+
+        sse_response = (
+            'data: {"type":"text","text":"Understood, I won\'t delete it."}\n'
+            'data: {"type":"finish","finishReason":"stop"}\n'
+        )
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/chat",
+            method="POST",
+            content=sse_response.encode(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        async with client:
+            events = []
+            async for event in client.send_tool_approval_response(
+                chat_id="chat-123",
+                approval_id="approval-def",
+                approved=False,
+                reason="Too dangerous",
+            ):
+                events.append(event)
+
+        # Verify rejection payload
+        requests = httpx_mock.get_requests()
+        post_request = [r for r in requests if r.method == "POST"][0]
+        body = json.loads(post_request.content)
+        tool_part = body["message"]["parts"][0]
+        assert tool_part["approval"]["approved"] is False
+        assert tool_part["approval"]["reason"] == "Too dangerous"
+
+    @pytest.mark.asyncio
+    async def test_send_tool_approval_response_not_found(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        """Test error when approval ID is not found in chat messages."""
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/chat/chat-123",
+            json={
+                "id": "chat-123",
+                "messages": [
+                    {
+                        "id": "msg-user",
+                        "role": "user",
+                        "parts": [{"type": "text", "text": "Hello"}],
+                    },
+                ],
+            },
+        )
+
+        async with client:
+            with pytest.raises(KaiError) as exc_info:
+                async for _ in client.send_tool_approval_response(
+                    chat_id="chat-123",
+                    approval_id="nonexistent-approval",
+                    approved=True,
+                ):
+                    pass
+
+        assert exc_info.value.code == "approval:not_found"
+
+    @pytest.mark.asyncio
+    async def test_send_tool_approval_response_with_branch_id(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        """Test v6 approval with branch_id parameter."""
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/chat/chat-123",
+            json={
+                "id": "chat-123",
+                "messages": [
+                    {
+                        "id": "msg-assistant",
+                        "role": "assistant",
+                        "parts": [
+                            {
+                                "type": "tool-create_config",
+                                "toolCallId": "call-003",
+                                "state": "approval-required",
+                                "approval": {"id": "approval-xyz"},
+                                "input": {"name": "test"},
+                            },
+                        ],
+                    },
+                ],
+            },
+        )
+
+        sse_response = 'data: {"type":"finish","finishReason":"stop"}\n'
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/chat",
+            method="POST",
+            content=sse_response.encode(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        async with client:
+            async for _ in client.send_tool_approval_response(
+                chat_id="chat-123",
+                approval_id="approval-xyz",
+                approved=True,
+                branch_id=42,
+            ):
+                pass
+
+        requests = httpx_mock.get_requests()
+        post_request = [r for r in requests if r.method == "POST"][0]
+        body = json.loads(post_request.content)
+        assert body["branchId"] == 42
+
+
+class TestApproveRejectToolConvenience:
+    """Tests for approve_tool and reject_tool convenience methods."""
+
+    @pytest.mark.asyncio
+    async def test_approve_tool(self, client: KaiClient, httpx_mock: HTTPXMock):
+        """Test approve_tool convenience method."""
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/chat/chat-123",
+            json={
+                "id": "chat-123",
+                "messages": [
+                    {
+                        "id": "msg-a",
+                        "role": "assistant",
+                        "parts": [
+                            {
+                                "type": "tool-run_job",
+                                "toolCallId": "call-010",
+                                "state": "approval-required",
+                                "approval": {"id": "appr-001"},
+                                "input": {"job_id": "123"},
+                            },
+                        ],
+                    },
+                ],
+            },
+        )
+
+        sse_response = (
+            'data: {"type":"text","text":"Job started."}\n'
+            'data: {"type":"finish","finishReason":"stop"}\n'
+        )
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/chat",
+            method="POST",
+            content=sse_response.encode(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        async with client:
+            events = []
+            async for event in client.approve_tool(
+                chat_id="chat-123",
+                approval_id="appr-001",
+            ):
+                events.append(event)
+
+        assert len(events) == 2
+        assert events[0].text == "Job started."
+
+        # Verify approved=True was sent
+        requests = httpx_mock.get_requests()
+        post_request = [r for r in requests if r.method == "POST"][0]
+        body = json.loads(post_request.content)
+        tool_part = body["message"]["parts"][0]
+        assert tool_part["approval"]["approved"] is True
+
+    @pytest.mark.asyncio
+    async def test_reject_tool(self, client: KaiClient, httpx_mock: HTTPXMock):
+        """Test reject_tool convenience method."""
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/chat/chat-123",
+            json={
+                "id": "chat-123",
+                "messages": [
+                    {
+                        "id": "msg-a",
+                        "role": "assistant",
+                        "parts": [
+                            {
+                                "type": "tool-deploy_data_app",
+                                "toolCallId": "call-020",
+                                "state": "approval-required",
+                                "approval": {"id": "appr-002"},
+                                "input": {"app_id": "456"},
+                            },
+                        ],
+                    },
+                ],
+            },
+        )
+
+        sse_response = (
+            'data: {"type":"text","text":"OK, cancelled."}\n'
+            'data: {"type":"finish","finishReason":"stop"}\n'
+        )
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/chat",
+            method="POST",
+            content=sse_response.encode(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        async with client:
+            events = []
+            async for event in client.reject_tool(
+                chat_id="chat-123",
+                approval_id="appr-002",
+                reason="Not needed",
+            ):
+                events.append(event)
+
+        assert events[0].text == "OK, cancelled."
+
+        requests = httpx_mock.get_requests()
+        post_request = [r for r in requests if r.method == "POST"][0]
+        body = json.loads(post_request.content)
+        tool_part = body["message"]["parts"][0]
+        assert tool_part["approval"]["approved"] is False
+        assert tool_part["approval"]["reason"] == "Not needed"
+
+
+class TestGetHistoryEndingBefore:
+    """Tests for get_history with ending_before parameter."""
+
+    @pytest.mark.asyncio
+    async def test_get_history_with_ending_before(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        """Test backward pagination with ending_before."""
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/history?limit=10&ending_before=chat-10",
+            json={"chats": [{"id": "chat-9"}], "hasMore": True},
+        )
+
+        async with client:
+            history = await client.get_history(limit=10, ending_before="chat-10")
+
+        assert len(history.chats) == 1
+        request = httpx_mock.get_request()
+        assert "ending_before=chat-10" in str(request.url)
+
+
+class TestParseVoteIsUpvotedFormat:
+    """Tests for _parse_vote with isUpvoted response format."""
+
+    def test_parse_vote_is_upvoted_true(self):
+        """Test parsing vote in isUpvoted format (upvoted)."""
+        data = {"chatId": "chat-1", "messageId": "msg-1", "isUpvoted": True}
+        vote = KaiClient._parse_vote(data)
+        assert vote.type == "up"
+        assert vote.chat_id == "chat-1"
+        assert vote.message_id == "msg-1"
+
+    def test_parse_vote_is_upvoted_false(self):
+        """Test parsing vote in isUpvoted format (downvoted)."""
+        data = {"chatId": "chat-1", "messageId": "msg-1", "isUpvoted": False}
+        vote = KaiClient._parse_vote(data)
+        assert vote.type == "down"
+
+    def test_parse_vote_is_upvoted_missing(self):
+        """Test parsing vote in isUpvoted format when field is missing."""
+        data = {"chatId": "chat-1", "messageId": "msg-1"}
+        vote = KaiClient._parse_vote(data)
+        assert vote.type == "down"  # Default when isUpvoted missing
+
+    @pytest.mark.asyncio
+    async def test_get_votes_is_upvoted_format(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        """Test get_votes when API returns isUpvoted format."""
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/vote?chatId=chat-123",
+            json=[
+                {"chatId": "chat-123", "messageId": "msg-1", "isUpvoted": True},
+                {"chatId": "chat-123", "messageId": "msg-2", "isUpvoted": False},
+            ],
+        )
+
+        async with client:
+            votes = await client.get_votes("chat-123")
+
+        assert len(votes) == 2
+        assert votes[0].type == "up"
+        assert votes[1].type == "down"
+
+
