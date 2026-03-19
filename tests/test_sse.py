@@ -1,6 +1,5 @@
 """Tests for SSE stream parser."""
 
-import json
 from unittest.mock import AsyncMock
 
 import httpx
