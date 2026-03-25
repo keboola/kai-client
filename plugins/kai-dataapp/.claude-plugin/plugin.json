@@ -1,0 +1,5 @@
+{
+  "name": "kai-dataapp",
+  "version": "1.0.0",
+  "description": "Claude Code plugin providing guidance for building Keboola data apps that integrate with the Keboola AI Assistant (Kai) — supports both Streamlit (Python) and JavaScript (Express/Node.js) backends"
+}
