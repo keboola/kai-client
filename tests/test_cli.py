@@ -812,3 +812,385 @@ class TestGetClientFunction:
                 storage_api_url="https://connection.keboola.com",
             )
             assert client == mock_client
+
+
+class TestInfoCommandEdgeCases:
+    """Tests for the info command with edge case MCP formats."""
+
+    def test_info_with_single_dict_mcp(self, runner, mock_env):
+        """Test info command when connectedMcp is a single dict instead of list."""
+        with patch("kai_client.cli.get_client") as mock_get_client:
+            mock_client = AsyncMock()
+            mock_client.info = AsyncMock(
+                return_value=InfoResponse(
+                    timestamp="2025-01-08T12:00:00Z",
+                    uptime=100.0,
+                    appName="kai-backend",
+                    appVersion="1.0.0",
+                    serverVersion="2.0.0",
+                    connectedMcp={"name": "keboola-mcp", "status": "connected"},
+                )
+            )
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_get_client.return_value = mock_client
+
+            result = runner.invoke(main, ["info"])
+
+            assert result.exit_code == 0
+            assert "keboola-mcp" in result.output
+            assert "connected" in result.output
+
+
+class TestChatInteractiveMode:
+    """Tests for interactive chat mode."""
+
+    def test_chat_interactive_exit(self, runner, mock_env):
+        """Test interactive mode with 'exit' command."""
+        with patch("kai_client.cli.get_client") as mock_get_client:
+            mock_client = AsyncMock()
+            mock_client.new_chat_id = MagicMock(return_value="test-chat-id")
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_get_client.return_value = mock_client
+
+            result = runner.invoke(main, ["chat"], input="exit\n")
+
+            assert result.exit_code == 0
+            assert "Interactive chat mode" in result.output
+            assert "Chat ended" in result.output
+
+    def test_chat_interactive_quit(self, runner, mock_env):
+        """Test interactive mode with 'quit' command."""
+        with patch("kai_client.cli.get_client") as mock_get_client:
+            mock_client = AsyncMock()
+            mock_client.new_chat_id = MagicMock(return_value="test-chat-id")
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_get_client.return_value = mock_client
+
+            result = runner.invoke(main, ["chat"], input="quit\n")
+
+            assert result.exit_code == 0
+            assert "Chat ended" in result.output
+
+    def test_chat_interactive_empty_input_skipped(self, runner, mock_env):
+        """Test that empty input is skipped in interactive mode."""
+        with patch("kai_client.cli.get_client") as mock_get_client:
+            mock_client = AsyncMock()
+            mock_client.new_chat_id = MagicMock(return_value="test-chat-id")
+
+            send_call_count = 0
+
+            async def mock_send_message(chat_id, message):
+                nonlocal send_call_count
+                send_call_count += 1
+                yield TextEvent(type="text", text="Response")
+                yield FinishEvent(type="finish", finishReason="stop")
+
+            mock_client.send_message = mock_send_message
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_get_client.return_value = mock_client
+
+            # Empty line, then a message, then exit
+            result = runner.invoke(main, ["chat"], input="\nHello\nexit\n")
+
+            assert result.exit_code == 0
+            assert send_call_count == 1  # Only the "Hello" message was sent
+
+    def test_chat_interactive_with_message_and_response(self, runner, mock_env):
+        """Test interactive mode sends message and shows response."""
+        with patch("kai_client.cli.get_client") as mock_get_client:
+            mock_client = AsyncMock()
+            mock_client.new_chat_id = MagicMock(return_value="test-chat-id")
+
+            async def mock_send_message(chat_id, message):
+                yield TextEvent(type="text", text="I can help!")
+                yield FinishEvent(type="finish", finishReason="stop")
+
+            mock_client.send_message = mock_send_message
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_get_client.return_value = mock_client
+
+            result = runner.invoke(main, ["chat"], input="Hello\nexit\n")
+
+            assert result.exit_code == 0
+            assert "I can help!" in result.output
+
+
+class TestChatV6ApprovalFlow:
+    """Tests for v6 tool approval flow in the CLI."""
+
+    def test_chat_v6_approval_auto_approve(self, runner, mock_env):
+        """Test auto-approve with v6 approval flow (approval_id)."""
+        with patch("kai_client.cli.get_client") as mock_get_client:
+            mock_client = AsyncMock()
+            mock_client.new_chat_id = MagicMock(return_value="test-chat-id")
+
+            from kai_client.models import ToolApprovalRequestEvent
+
+            async def mock_send_message(chat_id, message):
+                # Tool starts and waits for approval
+                yield ToolCallEvent(
+                    type="tool-call",
+                    toolCallId="tool-v6",
+                    toolName="update_descriptions",
+                    state="started",
+                )
+                yield ToolCallEvent(
+                    type="tool-call",
+                    toolCallId="tool-v6",
+                    toolName="update_descriptions",
+                    state="input-available",
+                    input={"descriptions": "new"},
+                )
+                # v6 approval request event
+                yield ToolApprovalRequestEvent(
+                    type="tool-approval-request",
+                    approvalId="appr-v6-001",
+                    toolCallId="tool-v6",
+                )
+
+            async def mock_approve_tool(chat_id, approval_id, **kwargs):
+                yield TextEvent(type="text", text="Descriptions updated!")
+                yield FinishEvent(type="finish", finishReason="stop")
+
+            mock_client.send_message = mock_send_message
+            mock_client.approve_tool = mock_approve_tool
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_get_client.return_value = mock_client
+
+            result = runner.invoke(
+                main, ["chat", "--auto-approve", "-m", "Update descriptions"]
+            )
+
+            assert result.exit_code == 0
+            assert "[Auto-approving...]" in result.output
+            assert "Descriptions updated!" in result.output
+
+    def test_chat_v6_approval_user_approve(self, runner, mock_env):
+        """Test manual user approval with v6 flow (click.confirm)."""
+        with patch("kai_client.cli.get_client") as mock_get_client:
+            mock_client = AsyncMock()
+            mock_client.new_chat_id = MagicMock(return_value="test-chat-id")
+
+            from kai_client.models import ToolApprovalRequestEvent
+
+            async def mock_send_message(chat_id, message):
+                yield ToolCallEvent(
+                    type="tool-call",
+                    toolCallId="tool-v6-2",
+                    toolName="create_config",
+                    state="started",
+                )
+                yield ToolCallEvent(
+                    type="tool-call",
+                    toolCallId="tool-v6-2",
+                    toolName="create_config",
+                    state="input-available",
+                    input={"name": "test"},
+                )
+                yield ToolApprovalRequestEvent(
+                    type="tool-approval-request",
+                    approvalId="appr-v6-002",
+                    toolCallId="tool-v6-2",
+                )
+
+            async def mock_approve_tool(chat_id, approval_id, **kwargs):
+                yield TextEvent(type="text", text="Config created!")
+                yield FinishEvent(type="finish", finishReason="stop")
+
+            mock_client.send_message = mock_send_message
+            mock_client.approve_tool = mock_approve_tool
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_get_client.return_value = mock_client
+
+            # User types 'y' to confirm
+            result = runner.invoke(
+                main, ["chat", "-m", "Create config"], input="y\n"
+            )
+
+            assert result.exit_code == 0
+            assert "Config created!" in result.output
+
+    def test_chat_v6_approval_user_reject(self, runner, mock_env):
+        """Test manual user rejection with v6 flow."""
+        with patch("kai_client.cli.get_client") as mock_get_client:
+            mock_client = AsyncMock()
+            mock_client.new_chat_id = MagicMock(return_value="test-chat-id")
+
+            from kai_client.models import ToolApprovalRequestEvent
+
+            async def mock_send_message(chat_id, message):
+                yield ToolCallEvent(
+                    type="tool-call",
+                    toolCallId="tool-v6-3",
+                    toolName="delete_bucket",
+                    state="started",
+                )
+                yield ToolCallEvent(
+                    type="tool-call",
+                    toolCallId="tool-v6-3",
+                    toolName="delete_bucket",
+                    state="input-available",
+                    input={"bucket_id": "in.c-test"},
+                )
+                yield ToolApprovalRequestEvent(
+                    type="tool-approval-request",
+                    approvalId="appr-v6-003",
+                    toolCallId="tool-v6-3",
+                )
+
+            async def mock_reject_tool(chat_id, approval_id, **kwargs):
+                yield TextEvent(type="text", text="OK, not deleting.")
+                yield FinishEvent(type="finish", finishReason="stop")
+
+            mock_client.send_message = mock_send_message
+            mock_client.reject_tool = mock_reject_tool
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_get_client.return_value = mock_client
+
+            # User types 'n' to reject
+            result = runner.invoke(
+                main, ["chat", "-m", "Delete bucket"], input="n\n"
+            )
+
+            assert result.exit_code == 0
+            assert "OK, not deleting." in result.output
+
+
+class TestDisplayToolResultEvents:
+    """Tests for display_tool_result_events function."""
+
+    def test_display_tool_output_error(self, runner, mock_env):
+        """Test that tool-output-error events are displayed."""
+        with patch("kai_client.cli.get_client") as mock_get_client:
+            mock_client = AsyncMock()
+            mock_client.new_chat_id = MagicMock(return_value="test-chat-id")
+
+            from kai_client.models import ToolOutputErrorEvent
+
+            async def mock_send_message(chat_id, message):
+                yield ToolCallEvent(
+                    type="tool-call",
+                    toolCallId="tool-err",
+                    toolName="run_job",
+                    state="input-available",
+                    input={"job_id": "123"},
+                )
+
+            async def mock_confirm_tool(chat_id, tool_call_id, tool_name):
+                yield ToolOutputErrorEvent(
+                    type="tool-output-error",
+                    toolCallId="tool-err",
+                    errorText="Job failed: timeout",
+                )
+                yield TextEvent(type="text", text="The job failed.")
+                yield FinishEvent(type="finish", finishReason="stop")
+
+            mock_client.send_message = mock_send_message
+            mock_client.confirm_tool = mock_confirm_tool
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_get_client.return_value = mock_client
+
+            result = runner.invoke(
+                main, ["chat", "--auto-approve", "-m", "Run job"]
+            )
+
+            assert result.exit_code == 0
+            assert "Tool Error: Job failed: timeout" in result.output
+
+    def test_display_tool_result_json_output(self, runner, mock_env):
+        """Test display_tool_result_events with json output mode."""
+        with patch("kai_client.cli.get_client") as mock_get_client:
+            mock_client = AsyncMock()
+            mock_client.new_chat_id = MagicMock(return_value="test-chat-id")
+
+            async def mock_send_message(chat_id, message):
+                yield ToolCallEvent(
+                    type="tool-call",
+                    toolCallId="tool-json",
+                    toolName="create_config",
+                    state="input-available",
+                    input={"name": "test"},
+                )
+
+            async def mock_confirm_tool(chat_id, tool_call_id, tool_name):
+                yield TextEvent(type="text", text="Done")
+                yield FinishEvent(type="finish", finishReason="stop")
+
+            mock_client.send_message = mock_send_message
+            mock_client.confirm_tool = mock_confirm_tool
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_get_client.return_value = mock_client
+
+            result = runner.invoke(
+                main, ["chat", "--auto-approve", "--json-output", "-m", "Create"]
+            )
+
+            assert result.exit_code == 0
+            # All output should be JSON lines
+            lines = [ln for ln in result.output.strip().split("\n") if ln]
+            for line in lines:
+                parsed = json.loads(line)
+                assert "type" in parsed
+
+
+class TestGetChatDisplayEdgeCases:
+    """Tests for get-chat display with various part types."""
+
+    def test_get_chat_no_title(self, runner, mock_env):
+        """Test get-chat when chat has no title."""
+        with patch("kai_client.cli.get_client") as mock_get_client:
+            mock_client = AsyncMock()
+            mock_client.get_chat = AsyncMock(
+                return_value=ChatDetail(
+                    id="chat-123",
+                    title=None,
+                    messages=[],
+                )
+            )
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_get_client.return_value = mock_client
+
+            result = runner.invoke(main, ["get-chat", "chat-123"])
+
+            assert result.exit_code == 0
+            assert "(no title)" in result.output
+
+    def test_get_chat_with_object_parts(self, runner, mock_env):
+        """Test get-chat with parts that are objects (have .text / .type attrs)."""
+
+        class FakeTextPart:
+            text = "Here's the result:"
+
+        class FakeToolPart:
+            type = "tool-call"
+
+        # Build a ChatDetail with object-style parts (not dicts)
+        chat = ChatDetail(id="chat-123", title="Test", messages=[])
+        msg = Message(id="msg-1", role="assistant", parts=[])
+        # Override parts with objects after construction
+        msg.parts = [FakeTextPart(), FakeToolPart()]  # type: ignore
+        chat.messages = [msg]
+
+        with patch("kai_client.cli.get_client") as mock_get_client:
+            mock_client = AsyncMock()
+            mock_client.get_chat = AsyncMock(return_value=chat)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_get_client.return_value = mock_client
+
+            result = runner.invoke(main, ["get-chat", "chat-123"])
+
+            assert result.exit_code == 0
+            assert "Here's the result:" in result.output
+            assert "[tool-call]" in result.output
