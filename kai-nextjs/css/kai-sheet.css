@@ -1,0 +1,69 @@
+/*
+ * KAI Client — Sheet & Chat CSS
+ * Copy verbatim into your globals.css (after your @theme block and base styles).
+ */
+
+/* ─── KAI Chat ───────────────────────────────────────────────────────────── */
+.kai-prose {
+  --tw-prose-body: var(--color-brand-secondary);
+  --tw-prose-headings: var(--color-brand-secondary);
+  --tw-prose-links: var(--color-brand-primary);
+  --tw-prose-code: var(--color-brand-secondary);
+  --tw-prose-pre-bg: #f8fafc;
+}
+
+@keyframes kai-bounce {
+  0%, 80%, 100% { transform: scale(0.7); opacity: 0.4; }
+  40%           { transform: scale(1.0); opacity: 1; }
+}
+.kai-dot { animation: kai-bounce 1.2s ease-in-out infinite; }
+.kai-dot:nth-child(1) { animation-delay: 0s; }
+.kai-dot:nth-child(2) { animation-delay: 0.2s; }
+.kai-dot:nth-child(3) { animation-delay: 0.4s; }
+
+.kai-textarea {
+  field-sizing: content;
+  min-height: 24px;
+  max-height: 128px;
+  resize: none;
+}
+
+/* ─── KAI Sheet (right-side drawer) ──────────────────────────────────────── */
+.kai-sheet {
+  position: fixed;
+  top: 0;
+  right: 0;
+  height: 100vh;
+  background: white;
+  border-left: 1px solid var(--color-border);
+  box-shadow: -4px 0 24px rgba(0, 0, 0, 0.08);
+  z-index: 40;
+  transform: translateX(100%);
+  transition: transform 0.25s cubic-bezier(0.32, 0.72, 0, 1), width 0.25s cubic-bezier(0.32, 0.72, 0, 1);
+}
+.kai-sheet[data-state="open"] {
+  transform: translateX(0);
+}
+.kai-sheet[data-layout="sidebar"] {
+  width: var(--chat-sheet-width, 420px);
+}
+.kai-sheet[data-layout="fullscreen"] {
+  width: 100%;
+  border-left: none;
+  box-shadow: none;
+}
+
+/* Overlay behind fullscreen sheet */
+.kai-sheet-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.15);
+  z-index: 39;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.25s ease;
+}
+.kai-sheet-overlay[data-state="open"] {
+  opacity: 1;
+  pointer-events: auto;
+}
