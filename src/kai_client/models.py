@@ -297,6 +297,10 @@ class UsageInfo(BaseModel):
 
     prompt_tokens: int = Field(default=0, alias="promptTokens")
     completion_tokens: int = Field(default=0, alias="completionTokens")
+    total_tokens: int = Field(default=0, alias="totalTokens")
+    cache_read_tokens: int = Field(default=0, alias="cacheReadTokens")
+    cache_write_tokens: int = Field(default=0, alias="cacheWriteTokens")
+    reasoning_tokens: int = Field(default=0, alias="reasoningTokens")
 
 
 class UsageEvent(BaseSSEEvent):
