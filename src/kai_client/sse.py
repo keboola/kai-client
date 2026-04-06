@@ -152,7 +152,7 @@ def _parse_usage_event(data: dict[str, Any]) -> UsageEvent:
     """Parse a data-usage event emitted by the backend via dataStream.write().
 
     The Vercel AI SDK prefixes custom data types with "data-", so the event
-    arrives as { type: "data-usage", data: { promptTokens, completionTokens } }.
+    arrives as { type: "data-usage", data: { promptTokens, completionTokens, ... } }.
     """
     usage_data = data.get("data", {})
     return UsageEvent(
@@ -160,6 +160,10 @@ def _parse_usage_event(data: dict[str, Any]) -> UsageEvent:
         usage=UsageInfo(
             promptTokens=usage_data.get("promptTokens", 0),
             completionTokens=usage_data.get("completionTokens", 0),
+            totalTokens=usage_data.get("totalTokens", 0),
+            cacheReadTokens=usage_data.get("cacheReadTokens", 0),
+            cacheWriteTokens=usage_data.get("cacheWriteTokens", 0),
+            reasoningTokens=usage_data.get("reasoningTokens", 0),
         ),
     )
 
