@@ -1532,3 +1532,521 @@ class TestAllBackendTools:
             assert pending_tools[0].input is not None
 
 
+# =============================================================================
+# Tests for new kai-agent backend endpoints
+# =============================================================================
+
+CHAT_ID = "550e8400-e29b-41d4-a716-446655440000"
+TOOL_USE_ID = "tool-use-abc123"
+
+
+class TestSubmitApproval:
+    """Tests for submit_approval — POST /api/chat/{id}/approval."""
+
+    @pytest.mark.asyncio
+    async def test_submit_approval_approved(self, client: KaiClient, httpx_mock: HTTPXMock):
+        httpx_mock.add_response(
+            url=f"http://localhost:3000/api/chat/{CHAT_ID}/approval",
+            method="POST",
+            json={"success": True, "toolUseId": TOOL_USE_ID, "approved": True},
+        )
+
+        async with client:
+            result = await client.submit_approval(CHAT_ID, TOOL_USE_ID, approved=True)
+
+        assert result.success is True
+        assert result.tool_use_id == TOOL_USE_ID
+        assert result.approved is True
+
+    @pytest.mark.asyncio
+    async def test_submit_approval_denied(self, client: KaiClient, httpx_mock: HTTPXMock):
+        httpx_mock.add_response(
+            url=f"http://localhost:3000/api/chat/{CHAT_ID}/approval",
+            method="POST",
+            json={"success": True, "toolUseId": TOOL_USE_ID, "approved": False},
+        )
+
+        async with client:
+            result = await client.submit_approval(
+                CHAT_ID, TOOL_USE_ID, approved=False, reason="Too risky"
+            )
+
+        assert result.approved is False
+
+        request = httpx_mock.get_request()
+        body = json.loads(request.content)
+        assert body["approved"] is False
+        assert body["reason"] == "Too risky"
+
+    @pytest.mark.asyncio
+    async def test_submit_approval_with_optional_fields(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        httpx_mock.add_response(
+            url=f"http://localhost:3000/api/chat/{CHAT_ID}/approval",
+            method="POST",
+            json={"success": True, "toolUseId": TOOL_USE_ID, "approved": True},
+        )
+
+        async with client:
+            await client.submit_approval(
+                CHAT_ID,
+                TOOL_USE_ID,
+                approved=True,
+                updated_input={"name": "updated-bucket"},
+                answers={"confirm": "yes"},
+            )
+
+        request = httpx_mock.get_request()
+        body = json.loads(request.content)
+        assert body["updatedInput"] == {"name": "updated-bucket"}
+        assert body["answers"] == {"confirm": "yes"}
+
+    @pytest.mark.asyncio
+    async def test_submit_approval_omits_none_fields(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        httpx_mock.add_response(
+            url=f"http://localhost:3000/api/chat/{CHAT_ID}/approval",
+            method="POST",
+            json={"success": True, "toolUseId": TOOL_USE_ID, "approved": True},
+        )
+
+        async with client:
+            await client.submit_approval(CHAT_ID, TOOL_USE_ID, approved=True)
+
+        request = httpx_mock.get_request()
+        body = json.loads(request.content)
+        assert "reason" not in body
+        assert "updatedInput" not in body
+        assert "answers" not in body
+
+    @pytest.mark.asyncio
+    async def test_submit_approval_includes_auth_headers(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        httpx_mock.add_response(
+            url=f"http://localhost:3000/api/chat/{CHAT_ID}/approval",
+            method="POST",
+            json={"success": True, "toolUseId": TOOL_USE_ID, "approved": True},
+        )
+
+        async with client:
+            await client.submit_approval(CHAT_ID, TOOL_USE_ID, approved=True)
+
+        request = httpx_mock.get_request()
+        assert request.headers["x-storageapi-token"] == "test-token"
+        assert "connection.test.keboola.com" in request.headers["x-storageapi-url"]
+
+    @pytest.mark.asyncio
+    async def test_submit_approval_not_found(self, client: KaiClient, httpx_mock: HTTPXMock):
+        httpx_mock.add_response(
+            url=f"http://localhost:3000/api/chat/{CHAT_ID}/approval",
+            method="POST",
+            status_code=404,
+            json={
+                "code": "not_found:chat",
+                "message": "No pending approval found for this tool call.",
+            },
+        )
+
+        async with client:
+            with pytest.raises(KaiNotFoundError):
+                await client.submit_approval(CHAT_ID, TOOL_USE_ID, approved=True)
+
+
+class TestGetUsage:
+    """Tests for get_usage — GET /api/usage."""
+
+    @pytest.mark.asyncio
+    async def test_get_usage_success(self, client: KaiClient, httpx_mock: HTTPXMock):
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/usage",
+            json={
+                "messagesUsed": 42,
+                "messagesLimit": 500,
+                "resetDate": "2026-06-01T00:00:00.000Z",
+            },
+        )
+
+        async with client:
+            usage = await client.get_usage()
+
+        assert usage.messages_used == 42
+        assert usage.messages_limit == 500
+        assert usage.reset_date.year == 2026
+        assert usage.reset_date.month == 6
+
+    @pytest.mark.asyncio
+    async def test_get_usage_includes_auth(self, client: KaiClient, httpx_mock: HTTPXMock):
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/usage",
+            json={
+                "messagesUsed": 0,
+                "messagesLimit": 500,
+                "resetDate": "2026-06-01T00:00:00.000Z",
+            },
+        )
+
+        async with client:
+            await client.get_usage()
+
+        request = httpx_mock.get_request()
+        assert "x-storageapi-token" in request.headers
+
+
+class TestSettings:
+    """Tests for project-level settings — GET/PATCH /api/settings."""
+
+    _settings_payload = {
+        "projectId": "proj-123",
+        "customInstructions": "Always be concise.",
+        "createdAt": "2026-01-01T00:00:00.000Z",
+        "updatedAt": "2026-05-01T00:00:00.000Z",
+    }
+
+    @pytest.mark.asyncio
+    async def test_get_settings_success(self, client: KaiClient, httpx_mock: HTTPXMock):
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/settings",
+            json=self._settings_payload,
+        )
+
+        async with client:
+            settings = await client.get_settings()
+
+        assert settings.project_id == "proj-123"
+        assert settings.custom_instructions == "Always be concise."
+
+    @pytest.mark.asyncio
+    async def test_get_settings_null_instructions(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/settings",
+            json={**self._settings_payload, "customInstructions": None},
+        )
+
+        async with client:
+            settings = await client.get_settings()
+
+        assert settings.custom_instructions is None
+
+    @pytest.mark.asyncio
+    async def test_update_settings_with_instructions(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/settings",
+            method="PATCH",
+            json={**self._settings_payload, "customInstructions": "Be brief."},
+        )
+
+        async with client:
+            settings = await client.update_settings(custom_instructions="Be brief.")
+
+        assert settings.custom_instructions == "Be brief."
+
+        request = httpx_mock.get_request()
+        body = json.loads(request.content)
+        assert body["customInstructions"] == "Be brief."
+
+    @pytest.mark.asyncio
+    async def test_update_settings_clear_instructions(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        """Passing custom_instructions=None explicitly clears the field."""
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/settings",
+            method="PATCH",
+            json={**self._settings_payload, "customInstructions": None},
+        )
+
+        async with client:
+            settings = await client.update_settings(custom_instructions=None)
+
+        assert settings.custom_instructions is None
+
+        request = httpx_mock.get_request()
+        body = json.loads(request.content)
+        assert body["customInstructions"] is None
+
+    @pytest.mark.asyncio
+    async def test_update_settings_no_args_sends_empty_payload(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        """Omitting all args is a no-op — sends empty payload, leaves server state unchanged."""
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/settings",
+            method="PATCH",
+            json=self._settings_payload,
+        )
+
+        async with client:
+            await client.update_settings()
+
+        request = httpx_mock.get_request()
+        body = json.loads(request.content)
+        assert "customInstructions" not in body
+
+
+class TestUserSettings:
+    """Tests for user-level settings — GET/PATCH /api/settings/user."""
+
+    _user_settings_payload = {
+        "projectId": "proj-123",
+        "userId": "user-456",
+        "customInstructions": None,
+        "toolPermissions": {"create_config": "always_ask"},
+        "createdAt": "2026-01-01T00:00:00.000Z",
+        "updatedAt": "2026-05-01T00:00:00.000Z",
+    }
+
+    @pytest.mark.asyncio
+    async def test_get_user_settings_success(self, client: KaiClient, httpx_mock: HTTPXMock):
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/settings/user",
+            json=self._user_settings_payload,
+        )
+
+        async with client:
+            settings = await client.get_user_settings()
+
+        assert settings.user_id == "user-456"
+        assert settings.tool_permissions == {"create_config": "always_ask"}
+
+    @pytest.mark.asyncio
+    async def test_update_user_settings_tool_permissions(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        updated = {
+            **self._user_settings_payload,
+            "toolPermissions": {"create_config": "always_allow", "run_job": "blocked"},
+        }
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/settings/user",
+            method="PATCH",
+            json=updated,
+        )
+
+        async with client:
+            settings = await client.update_user_settings(
+                tool_permissions={"create_config": "always_allow", "run_job": "blocked"}
+            )
+
+        assert settings.tool_permissions["run_job"] == "blocked"
+
+        request = httpx_mock.get_request()
+        body = json.loads(request.content)
+        assert body["toolPermissions"]["create_config"] == "always_allow"
+
+    @pytest.mark.asyncio
+    async def test_update_user_settings_custom_instructions_only(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/settings/user",
+            method="PATCH",
+            json={**self._user_settings_payload, "customInstructions": "Speak formally."},
+        )
+
+        async with client:
+            await client.update_user_settings(custom_instructions="Speak formally.")
+
+        request = httpx_mock.get_request()
+        body = json.loads(request.content)
+        assert body["customInstructions"] == "Speak formally."
+        assert "toolPermissions" not in body
+
+    @pytest.mark.asyncio
+    async def test_update_user_settings_null_permissions_reset(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        """Passing tool_permissions=None explicitly resets permissions."""
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/settings/user",
+            method="PATCH",
+            json={**self._user_settings_payload, "toolPermissions": None},
+        )
+
+        async with client:
+            settings = await client.update_user_settings(tool_permissions=None)
+
+        assert settings.tool_permissions is None
+
+        request = httpx_mock.get_request()
+        body = json.loads(request.content)
+        assert body.get("toolPermissions") is None
+
+    @pytest.mark.asyncio
+    async def test_update_user_settings_clear_custom_instructions(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        """Passing custom_instructions=None explicitly clears the field."""
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/settings/user",
+            method="PATCH",
+            json={**self._user_settings_payload, "customInstructions": None},
+        )
+
+        async with client:
+            await client.update_user_settings(custom_instructions=None)
+
+        request = httpx_mock.get_request()
+        body = json.loads(request.content)
+        assert body["customInstructions"] is None
+        assert "toolPermissions" not in body
+
+    @pytest.mark.asyncio
+    async def test_update_user_settings_no_args_raises(self, client: KaiClient):
+        """Calling with no arguments raises ValueError."""
+        with pytest.raises(ValueError, match="at least one argument"):
+            await client.update_user_settings()
+
+
+class TestGetTools:
+    """Tests for get_tools — GET /api/settings/tools."""
+
+    @pytest.mark.asyncio
+    async def test_get_tools_success(self, client: KaiClient, httpx_mock: HTTPXMock):
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/settings/tools",
+            json={
+                "tools": [
+                    {"name": "get_tables", "description": "List tables", "readOnly": True},
+                    {"name": "create_config", "description": "Create config", "readOnly": False},
+                ]
+            },
+        )
+
+        async with client:
+            result = await client.get_tools()
+
+        assert len(result.tools) == 2
+        assert result.tools[0].name == "get_tables"
+        assert result.tools[0].read_only is True
+        assert result.tools[1].name == "create_config"
+        assert result.tools[1].read_only is False
+
+    @pytest.mark.asyncio
+    async def test_get_tools_empty_list(self, client: KaiClient, httpx_mock: HTTPXMock):
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/settings/tools",
+            json={"tools": []},
+        )
+
+        async with client:
+            result = await client.get_tools()
+
+        assert result.tools == []
+
+    @pytest.mark.asyncio
+    async def test_get_tools_includes_auth(self, client: KaiClient, httpx_mock: HTTPXMock):
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/settings/tools",
+            json={"tools": []},
+        )
+
+        async with client:
+            await client.get_tools()
+
+        request = httpx_mock.get_request()
+        assert "x-storageapi-token" in request.headers
+
+
+class TestGetSuggestions:
+    """Tests for get_suggestions — POST /api/suggestions."""
+
+    _suggestion = {
+        "id": "550e8400-e29b-41d4-a716-446655440001",
+        "label": "Fix failing job",
+        "prompt": "Help me fix the failing extraction job",
+        "priority": 1,
+        "category": "error",
+        "reasoning": "Job has been failing repeatedly",
+    }
+
+    @pytest.mark.asyncio
+    async def test_get_suggestions_success(self, client: KaiClient, httpx_mock: HTTPXMock):
+        session_id = "550e8400-e29b-41d4-a716-446655440002"
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/suggestions",
+            method="POST",
+            json={"suggestions": [self._suggestion], "suggestionSessionId": session_id},
+        )
+
+        async with client:
+            result = await client.get_suggestions(
+                context="job-detail", data={"jobId": "job-123", "status": "error"}
+            )
+
+        assert len(result.suggestions) == 1
+        assert result.suggestions[0].label == "Fix failing job"
+        assert result.suggestions[0].category == "error"
+        assert result.suggestion_session_id == session_id
+
+    @pytest.mark.asyncio
+    async def test_get_suggestions_sends_correct_payload(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/suggestions",
+            method="POST",
+            json={
+                "suggestions": [],
+                "suggestionSessionId": "550e8400-e29b-41d4-a716-446655440003",
+            },
+        )
+
+        async with client:
+            await client.get_suggestions(
+                context="dashboard", data={"projectId": "proj-123"}
+            )
+
+        request = httpx_mock.get_request()
+        body = json.loads(request.content)
+        assert body["context"] == "dashboard"
+        assert body["data"] == {"projectId": "proj-123"}
+
+    @pytest.mark.asyncio
+    async def test_get_suggestions_empty_result(self, client: KaiClient, httpx_mock: HTTPXMock):
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/suggestions",
+            method="POST",
+            json={
+                "suggestions": [],
+                "suggestionSessionId": "550e8400-e29b-41d4-a716-446655440004",
+            },
+        )
+
+        async with client:
+            result = await client.get_suggestions(context="dashboard", data={})
+
+        assert result.suggestions == []
+
+    @pytest.mark.asyncio
+    async def test_get_suggestions_context_variants(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        contexts = ("dashboard", "job-detail", "configuration-detail")
+        for _ in contexts:
+            httpx_mock.add_response(
+                url="http://localhost:3000/api/suggestions",
+                method="POST",
+                json={
+                    "suggestions": [],
+                    "suggestionSessionId": "550e8400-e29b-41d4-a716-446655440005",
+                },
+            )
+
+        async with client:
+            for context in contexts:
+                await client.get_suggestions(context=context, data={})
+
+        requests = httpx_mock.get_requests()
+        assert len(requests) == len(contexts)
+        for req, context in zip(requests, contexts):
+            body = json.loads(req.content)
+            assert body["context"] == context
+
+
