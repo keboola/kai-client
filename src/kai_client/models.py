@@ -352,7 +352,7 @@ class ToolCallEvent(BaseSSEEvent):
     tool_name: Optional[str] = Field(default=None, alias="toolName")
     state: str
     input: Optional[dict[str, Any]] = None
-    output: Optional[dict[str, Any]] = None
+    output: Optional[Any] = None
     approval: Optional[ToolApproval] = None
 
 
