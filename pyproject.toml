@@ -1,6 +1,6 @@
 [project]
 name = "kai-client"
-version = "0.11.0"
+version = "0.12.0"
 description = "Python client library for the Keboola AI Assistant Backend API"
 readme = "README.md"
 license = { text = "MIT" }
