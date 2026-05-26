@@ -2,6 +2,7 @@
 
 import json
 
+import httpx
 import pytest
 from click.testing import CliRunner
 
@@ -161,3 +162,92 @@ class TestVerifyCommand:
         assert data["checks"]["token"]["project_id"] == 2738
         assert data["checks"]["usage"]["messages_used"] == 19
         assert data["checks"]["usage"]["messages_limit"] == 150
+
+    def test_scoped_token_renders_as_scoped(self, runner, mock_env, httpx_mock):
+        """Non-master tokens should label as [scoped] (not [master])."""
+        _mock_token_verify_ok(httpx_mock, is_master=False)
+        _mock_discovery_ok(httpx_mock)
+        _mock_ping_info_ok(httpx_mock)
+        httpx_mock.add_response(
+            url=f"{KAI_URL}/api/usage",
+            method="GET",
+            json={
+                "messagesUsed": 5,
+                "messagesLimit": 150,
+                "resetDate": "2026-06-01T00:00:00Z",
+            },
+        )
+
+        result = runner.invoke(main, ["verify"])
+
+        assert result.exit_code == 0, result.output
+        assert "[scoped]" in result.output
+        assert "[master]" not in result.output
+
+    def test_storage_api_connection_error_renders_cleanly(self, runner, mock_env, httpx_mock):
+        """If Storage API is unreachable, token check fails with a connection-error line."""
+        httpx_mock.add_exception(
+            httpx.ConnectError("Network unreachable"),
+            url=f"{STORAGE_URL}/v2/storage/tokens/verify",
+        )
+
+        result = runner.invoke(main, ["verify"])
+
+        assert result.exit_code == 1
+        assert "connection error" in result.output.lower()
+        assert "Network unreachable" in result.output
+
+    def test_base_url_skips_discovery(self, runner, mock_env, httpx_mock):
+        """`--base-url` bypasses /v2/storage discovery and talks to the given URL directly."""
+        local_url = "http://localhost:4000"
+        _mock_token_verify_ok(httpx_mock)
+        # No /v2/storage mock — would error if discovery were attempted.
+        httpx_mock.add_response(
+            url=f"{local_url}/ping",
+            method="GET",
+            json={"timestamp": "2026-05-26T10:00:00Z"},
+        )
+        httpx_mock.add_response(
+            url=f"{local_url}/api",
+            method="GET",
+            json={
+                "timestamp": "2026-05-26T10:00:00Z",
+                "appName": "kai-assistant",
+                "appVersion": "dev",
+                "serverVersion": "dev",
+                "uptime": 12.0,
+                "connectedMcp": [],
+            },
+        )
+        httpx_mock.add_response(
+            url=f"{local_url}/api/usage",
+            method="GET",
+            json={
+                "messagesUsed": 0,
+                "messagesLimit": 150,
+                "resetDate": "2026-06-01T00:00:00Z",
+            },
+        )
+
+        result = runner.invoke(main, ["--base-url", local_url, "verify"])
+
+        assert result.exit_code == 0, result.output
+        assert f"using --base-url {local_url}" in result.output
+        assert "All checks passed." in result.output
+
+    def test_service_discovery_failure_when_kai_assistant_absent(
+        self, runner, mock_env, httpx_mock
+    ):
+        """If the services list has no kai-assistant entry, discovery fails cleanly."""
+        _mock_token_verify_ok(httpx_mock)
+        httpx_mock.add_response(
+            url=f"{STORAGE_URL}/v2/storage",
+            method="GET",
+            json={"services": [{"id": "queue", "url": "https://queue.example/"}]},
+        )
+
+        result = runner.invoke(main, ["verify"])
+
+        assert result.exit_code == 1
+        assert "service-discovery" in result.output
+        assert "kai-assistant service not found" in result.output

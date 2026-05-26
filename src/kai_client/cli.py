@@ -149,6 +149,168 @@ def info(ctx):
     run_async(_info())
 
 
+class _VerifyRecorder:
+    """Collects per-check results for `kai verify` and prints them inline."""
+
+    def __init__(self, json_output: bool) -> None:
+        self.json_output = json_output
+        self.report: dict[str, Any] = {"ok": True, "checks": {}}
+
+    def record(self, name: str, ok: bool, summary: str, **extra: Any) -> None:
+        self.report["checks"][name] = {"ok": ok, "summary": summary, **extra}
+        if not ok:
+            self.report["ok"] = False
+        if not self.json_output:
+            mark = click.style("✓", fg="green") if ok else click.style("✗", fg="red")
+            click.echo(f"{mark} {name}: {summary}")
+
+
+def _format_kai_error(e: KaiError) -> str:
+    """Render a KaiError as `code: message`, falling back to message-only."""
+    if e.code and e.message:
+        return f"{e.code}: {e.message}"
+    return e.message or str(e)
+
+
+def _safe_json_body(resp: httpx.Response) -> dict[str, Any]:
+    """Parse `resp` as a JSON object, falling back to `{'error': <text>}`."""
+    if "application/json" in resp.headers.get("content-type", ""):
+        try:
+            parsed = resp.json()
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            return parsed
+    return {"error": resp.text}
+
+
+async def _check_token(url: str, token: str, recorder: _VerifyRecorder) -> Optional[dict[str, Any]]:
+    """Verify the token via Storage API; return the parsed token info on success."""
+    async with httpx.AsyncClient() as http_client:
+        try:
+            resp = await http_client.get(
+                f"{url.rstrip('/')}/v2/storage/tokens/verify",
+                headers={"x-storageapi-token": token},
+                timeout=30.0,
+            )
+        except httpx.RequestError as e:
+            recorder.record("token", False, f"connection error: {e}")
+            return None
+
+    if resp.status_code >= 400:
+        body = _safe_json_body(resp)
+        code = body.get("code") or f"http:{resp.status_code}"
+        msg = body.get("error") or body.get("message") or resp.reason_phrase
+        recorder.record("token", False, f"HTTP {resp.status_code} {code}: {msg}")
+        return None
+
+    parsed = resp.json()
+    if not isinstance(parsed, dict):
+        recorder.record("token", False, f"unexpected response shape: {type(parsed).__name__}")
+        return None
+
+    owner = parsed.get("owner") or {}
+    project_id = owner.get("id")
+    project_name = owner.get("name", "?")
+    description = parsed.get("description", "?")
+    is_master = parsed.get("isMasterToken", False)
+    token_type = "master" if is_master else "scoped"
+    summary = f"project {project_id} ({project_name}), token '{description}' [{token_type}]"
+    recorder.record(
+        "token",
+        True,
+        summary,
+        project_id=project_id,
+        project_name=project_name,
+        token_description=description,
+        is_master_token=is_master,
+    )
+    return parsed
+
+
+async def _check_service_discovery(
+    token: str, url: str, base_url: Optional[str], recorder: _VerifyRecorder
+) -> Optional[KaiClient]:
+    """Build a KaiClient (auto-discover or honour --base-url for local dev)."""
+    try:
+        if base_url:
+            client = KaiClient(storage_api_token=token, storage_api_url=url, base_url=base_url)
+            recorder.record("service-discovery", True, f"using --base-url {base_url}")
+        else:
+            client = await KaiClient.from_storage_api(storage_api_token=token, storage_api_url=url)
+            recorder.record(
+                "service-discovery",
+                True,
+                f"kai-assistant at {client.base_url}",
+            )
+    except KaiError as e:
+        recorder.record(
+            "service-discovery",
+            False,
+            _format_kai_error(e),
+            code=e.code,
+            message=e.message,
+        )
+        return None
+    return client
+
+
+async def _check_reachability(client: KaiClient, recorder: _VerifyRecorder) -> None:
+    """Ping + info (no auth). Records each independently."""
+    try:
+        ping_resp = await client.ping()
+        recorder.record("ping", True, f"server alive at {ping_resp.timestamp.isoformat()}")
+    except KaiError as e:
+        recorder.record("ping", False, _format_kai_error(e), code=e.code, message=e.message)
+
+    try:
+        info_resp = await client.info()
+        recorder.record(
+            "info",
+            True,
+            f"{info_resp.app_name} v{info_resp.app_version} "
+            f"(server v{info_resp.server_version}, uptime {info_resp.uptime:.0f}s)",
+            server_version=info_resp.server_version,
+        )
+    except KaiError as e:
+        recorder.record("info", False, _format_kai_error(e), code=e.code, message=e.message)
+
+
+async def _check_usage(client: KaiClient, recorder: _VerifyRecorder) -> None:
+    """Authenticated probe + monthly message quota.
+
+    The KaiError handler renders any upstream `{code, message}` cleanly. The
+    headline symptom this command was built for is 429 ``rate_limit:chat``,
+    but 401/403/timeout etc. all surface through the same path.
+    """
+    try:
+        usage = await client.get_usage()
+        remaining = usage.messages_limit - usage.messages_used
+        recorder.record(
+            "usage",
+            True,
+            f"{usage.messages_used}/{usage.messages_limit} messages used "
+            f"(resets {usage.reset_date.date().isoformat()}, {remaining} left)",
+            messages_used=usage.messages_used,
+            messages_limit=usage.messages_limit,
+            reset_date=usage.reset_date.isoformat(),
+        )
+    except KaiError as e:
+        recorder.record("usage", False, _format_kai_error(e), code=e.code, message=e.message)
+
+
+def _emit_verify_footer(recorder: _VerifyRecorder) -> None:
+    """Print the final summary line (JSON dump or human-readable footer)."""
+    if recorder.json_output:
+        click.echo(json.dumps(recorder.report, indent=2, default=str))
+    elif recorder.report["ok"]:
+        click.echo()
+        click.echo(click.style("All checks passed.", fg="green"))
+    else:
+        click.echo()
+        click.echo(click.style("Some checks failed — see above.", fg="red"), err=True)
+
+
 @main.command()
 @click.option("--json-output", is_flag=True, help="Output as JSON")
 @click.pass_context
@@ -171,163 +333,27 @@ def verify(ctx, json_output: bool):
         url = ctx.obj.get("url") or get_env_or_error("STORAGE_API_URL")
         base_url = ctx.obj.get("base_url")
 
-        report: dict[str, Any] = {"ok": True, "checks": {}}
-
-        def _print_check(name: str, ok: bool, summary: str) -> None:
-            if json_output:
-                return
-            mark = click.style("✓", fg="green") if ok else click.style("✗", fg="red")
-            click.echo(f"{mark} {name}: {summary}")
-
-        def _record(name: str, ok: bool, summary: str, **extra: Any) -> None:
-            report["checks"][name] = {"ok": ok, "summary": summary, **extra}
-            if not ok:
-                report["ok"] = False
-            _print_check(name, ok, summary)
-
+        recorder = _VerifyRecorder(json_output)
         if not json_output:
             click.echo(f"Storage API URL: {url}")
 
-        # 1. Token identity (Keboola Storage API)
-        token_data: Optional[dict[str, Any]] = None
-        async with httpx.AsyncClient() as http_client:
-            try:
-                resp = await http_client.get(
-                    f"{url.rstrip('/')}/v2/storage/tokens/verify",
-                    headers={"x-storageapi-token": token},
-                    timeout=30.0,
-                )
-                if resp.status_code >= 400:
-                    body: dict[str, Any] = {}
-                    if "application/json" in resp.headers.get("content-type", ""):
-                        parsed = resp.json()
-                        if isinstance(parsed, dict):
-                            body = parsed
-                    if not body:
-                        body = {"error": resp.text}
-                    code = body.get("code") or f"http:{resp.status_code}"
-                    msg = body.get("error") or body.get("message") or resp.reason_phrase
-                    _record("token", False, f"HTTP {resp.status_code} {code}: {msg}")
-                else:
-                    parsed = resp.json()
-                    assert isinstance(parsed, dict), (
-                        "Storage API token verify must return JSON object"
-                    )
-                    token_data = parsed
-                    owner = token_data.get("owner") or {}
-                    project_id = owner.get("id")
-                    project_name = owner.get("name", "?")
-                    description = token_data.get("description", "?")
-                    is_master = token_data.get("isMasterToken", False)
-                    token_type = "master" if is_master else "scoped"
-                    summary = (
-                        f"project {project_id} ({project_name}), "
-                        f"token '{description}' [{token_type}]"
-                    )
-                    _record(
-                        "token",
-                        True,
-                        summary,
-                        project_id=project_id,
-                        project_name=project_name,
-                        token_description=description,
-                        is_master_token=is_master,
-                    )
-            except httpx.RequestError as e:
-                _record("token", False, f"connection error: {e}")
-
-        # If the token didn't verify, the remaining checks will all fail the same way.
-        # Bail early with a non-zero exit so this command stays useful in scripts.
-        if not token_data:
-            if json_output:
-                click.echo(json.dumps(report, indent=2, default=str))
+        if await _check_token(url, token, recorder) is None:
+            _emit_verify_footer(recorder)
             sys.exit(1)
 
-        # 2. Build a KaiClient: respect --base-url for local dev; otherwise auto-discover.
-        client: Optional[KaiClient] = None
-        try:
-            if base_url:
-                client = KaiClient(storage_api_token=token, storage_api_url=url, base_url=base_url)
-                _record("service-discovery", True, f"using --base-url {base_url}")
-            else:
-                client = await KaiClient.from_storage_api(
-                    storage_api_token=token, storage_api_url=url
-                )
-                _record("service-discovery", True, f"kai-assistant at {client.base_url}")
-        except KaiError as e:
-            _record(
-                "service-discovery",
-                False,
-                _format_kai_error(e),
-                code=e.code,
-                message=e.message,
-            )
-
+        client = await _check_service_discovery(token, url, base_url, recorder)
         if client is None:
-            if json_output:
-                click.echo(json.dumps(report, indent=2, default=str))
+            _emit_verify_footer(recorder)
             sys.exit(1)
 
         async with client:
-            # 3. Reachability (no auth needed)
-            try:
-                ping_resp = await client.ping()
-                _record("ping", True, f"server alive at {ping_resp.timestamp.isoformat()}")
-            except KaiError as e:
-                _record("ping", False, _format_kai_error(e), code=e.code, message=e.message)
+            await _check_reachability(client, recorder)
+            await _check_usage(client, recorder)
 
-            try:
-                info_resp = await client.info()
-                _record(
-                    "info",
-                    True,
-                    f"{info_resp.app_name} v{info_resp.app_version} "
-                    f"(server v{info_resp.server_version}, uptime {info_resp.uptime:.0f}s)",
-                    server_version=info_resp.server_version,
-                )
-            except KaiError as e:
-                _record("info", False, _format_kai_error(e), code=e.code, message=e.message)
-
-            # 4. Authenticated probe + quota — the whole point of this command.
-            try:
-                usage = await client.get_usage()
-                remaining = usage.messages_limit - usage.messages_used
-                summary = (
-                    f"{usage.messages_used}/{usage.messages_limit} messages used "
-                    f"(resets {usage.reset_date.date().isoformat()}, {remaining} left)"
-                )
-                _record(
-                    "usage",
-                    True,
-                    summary,
-                    messages_used=usage.messages_used,
-                    messages_limit=usage.messages_limit,
-                    reset_date=usage.reset_date.isoformat(),
-                )
-            except KaiError as e:
-                # Specifically surface 429 rate_limit:chat cleanly — that's the symptom
-                # this whole command exists to diagnose.
-                _record("usage", False, _format_kai_error(e), code=e.code, message=e.message)
-
-        if json_output:
-            click.echo(json.dumps(report, indent=2, default=str))
-        elif report["ok"]:
-            click.echo()
-            click.echo(click.style("All checks passed.", fg="green"))
-        else:
-            click.echo()
-            click.echo(click.style("Some checks failed — see above.", fg="red"), err=True)
-
-        sys.exit(0 if report["ok"] else 1)
+        _emit_verify_footer(recorder)
+        sys.exit(0 if recorder.report["ok"] else 1)
 
     run_async(_verify())
-
-
-def _format_kai_error(e: KaiError) -> str:
-    """Render a KaiError as `code: message`, falling back to message-only."""
-    if e.code and e.message:
-        return f"{e.code}: {e.message}"
-    return e.message or str(e)
 
 
 @main.command()

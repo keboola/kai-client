@@ -188,7 +188,10 @@ async function readSSEStream(url, fetchOptions, onEvent) {
     const e = body && body.error;
     if (e && typeof e === "object") {
       const prefix = e.code ? `${e.status || res.status} ${e.code}` : `${e.status || res.status}`;
-      addError(`${prefix} — ${e.message || "Request failed"}`);
+      // Prefer message, then code, then a generic fallback — handles {code} bodies
+      // with no message field.
+      const detail = e.message || e.code || "Request failed";
+      addError(`${prefix} — ${detail}`);
     } else {
       addError(`Error: ${typeof e === "string" ? e : res.statusText}`);
     }
