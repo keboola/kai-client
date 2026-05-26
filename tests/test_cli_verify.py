@@ -251,3 +251,67 @@ class TestVerifyCommand:
         assert result.exit_code == 1
         assert "service-discovery" in result.output
         assert "kai-assistant service not found" in result.output
+
+    def test_json_output_on_failure_path(self, runner, mock_env, httpx_mock):
+        """A failed token verify with --json-output still returns a well-formed JSON report."""
+        httpx_mock.add_response(
+            url=f"{STORAGE_URL}/v2/storage/tokens/verify",
+            method="GET",
+            status_code=401,
+            json={"error": "Invalid access token", "code": "storage.tokenInvalid"},
+        )
+
+        result = runner.invoke(main, ["verify", "--json-output"])
+
+        assert result.exit_code == 1
+        data = json.loads(result.output)
+        assert data["ok"] is False
+        assert data["checks"]["token"]["ok"] is False
+        assert "storage.tokenInvalid" in data["checks"]["token"]["summary"]
+        # On token-check failure, later phases must not run.
+        assert "service-discovery" not in data["checks"]
+        assert "ping" not in data["checks"]
+        assert "usage" not in data["checks"]
+
+    def test_reachability_records_ping_and_info_independently(self, runner, mock_env, httpx_mock):
+        """When ping fails but info succeeds, both are recorded — info is not short-circuited."""
+        _mock_token_verify_ok(httpx_mock)
+        _mock_discovery_ok(httpx_mock)
+        httpx_mock.add_response(
+            url=f"{KAI_URL}/ping",
+            method="GET",
+            status_code=503,
+            json={"code": "service_unavailable", "message": "ping path is down"},
+        )
+        httpx_mock.add_response(
+            url=f"{KAI_URL}/api",
+            method="GET",
+            json={
+                "timestamp": "2026-05-26T10:00:00Z",
+                "appName": "kai-assistant",
+                "appVersion": "1.2.3",
+                "serverVersion": "1.2.3",
+                "uptime": 3600.0,
+                "connectedMcp": [],
+            },
+        )
+        httpx_mock.add_response(
+            url=f"{KAI_URL}/api/usage",
+            method="GET",
+            json={
+                "messagesUsed": 10,
+                "messagesLimit": 150,
+                "resetDate": "2026-06-01T00:00:00Z",
+            },
+        )
+
+        result = runner.invoke(main, ["verify", "--json-output"])
+
+        # Overall ok=false because ping failed, but info AND usage still ran.
+        assert result.exit_code == 1
+        data = json.loads(result.output)
+        assert data["checks"]["ping"]["ok"] is False
+        assert "service_unavailable" in data["checks"]["ping"]["summary"]
+        assert data["checks"]["info"]["ok"] is True
+        assert data["checks"]["usage"]["ok"] is True
+        assert data["checks"]["usage"]["messages_used"] == 10

@@ -204,7 +204,14 @@ async def _check_token(url: str, token: str, recorder: _VerifyRecorder) -> Optio
         recorder.record("token", False, f"HTTP {resp.status_code} {code}: {msg}")
         return None
 
-    parsed = resp.json()
+    # Symmetric with the >= 400 branch: tolerate a malformed-but-2xx body
+    # so the diagnostic surfaces "Storage API returned malformed JSON"
+    # instead of crashing with JSONDecodeError.
+    try:
+        parsed = resp.json()
+    except ValueError as e:
+        recorder.record("token", False, f"malformed JSON in 2xx response: {e}")
+        return None
     if not isinstance(parsed, dict):
         recorder.record("token", False, f"unexpected response shape: {type(parsed).__name__}")
         return None
@@ -256,7 +263,14 @@ async def _check_service_discovery(
 
 
 async def _check_reachability(client: KaiClient, recorder: _VerifyRecorder) -> None:
-    """Ping + info (no auth). Records each independently."""
+    """Ping + info (no auth).
+
+    Both checks run independently — `info` is not short-circuited when `ping`
+    fails. The two endpoints can fail in different ways (e.g. ping returns 200
+    but info returns 500 if a downstream MCP server is unhealthy), so showing
+    both results yields better diagnostic signal than collapsing to a single
+    line. The cost is one extra HTTP request on a totally-down service.
+    """
     try:
         ping_resp = await client.ping()
         recorder.record("ping", True, f"server alive at {ping_resp.timestamp.isoformat()}")
