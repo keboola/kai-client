@@ -70,7 +70,22 @@ async function proxySSE(payload, res) {
 
   if (!upstream.ok) {
     const text = await upstream.text();
-    return res.status(upstream.status).json({ error: text });
+    // Try to parse the upstream body as a structured KAI error
+    // ({code, message}) so the frontend can render a clean message
+    // instead of the raw JSON blob. Common shapes hit here:
+    //   429 → {"code":"rate_limit:chat","message":"You have exceeded..."}
+    //   401 → {"code":"unauthorized:chat","message":"..."}
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      parsed = null;
+    }
+    const error =
+      parsed && typeof parsed === "object" && (parsed.code || parsed.message)
+        ? { status: upstream.status, code: parsed.code, message: parsed.message }
+        : { status: upstream.status, message: text || upstream.statusText };
+    return res.status(upstream.status).json({ error });
   }
 
   res.setHeader("Content-Type", "text/event-stream");

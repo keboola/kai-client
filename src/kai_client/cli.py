@@ -5,9 +5,10 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import click
+import httpx
 from dotenv import load_dotenv
 
 # Load .env.local file if it exists (before any commands run)
@@ -16,6 +17,7 @@ if _env_local.exists():
     load_dotenv(_env_local)
 
 from kai_client import KaiClient, __version__  # noqa: E402
+from kai_client.exceptions import KaiError  # noqa: E402
 from kai_client.models import ToolApprovalRequestEvent  # noqa: E402
 from kai_client.types import VoteType  # noqa: E402
 
@@ -64,6 +66,9 @@ def main(ctx, token: Optional[str], url: Optional[str], base_url: Optional[str])
 
         # Check server health
         kai ping
+
+        # Diagnose token / service / quota when things misbehave
+        kai verify
 
         # Start an interactive chat
         kai chat
@@ -145,6 +150,187 @@ def info(ctx):
 
 
 @main.command()
+@click.option("--json-output", is_flag=True, help="Output as JSON")
+@click.pass_context
+def verify(ctx, json_output: bool):
+    """
+    Diagnose Kai setup: token identity, service reachability, message quota.
+
+    Use this when "it works in the Keboola platform UI but my app errors out".
+    Verify confirms which project/user the token resolves to, that the
+    kai-assistant service is reachable, and your current monthly message usage.
+
+    Examples:
+
+        kai verify
+        kai verify --json-output
+    """
+
+    async def _verify():
+        token = ctx.obj.get("token") or get_env_or_error("STORAGE_API_TOKEN")
+        url = ctx.obj.get("url") or get_env_or_error("STORAGE_API_URL")
+        base_url = ctx.obj.get("base_url")
+
+        report: dict[str, Any] = {"ok": True, "checks": {}}
+
+        def _print_check(name: str, ok: bool, summary: str) -> None:
+            if json_output:
+                return
+            mark = click.style("✓", fg="green") if ok else click.style("✗", fg="red")
+            click.echo(f"{mark} {name}: {summary}")
+
+        def _record(name: str, ok: bool, summary: str, **extra: Any) -> None:
+            report["checks"][name] = {"ok": ok, "summary": summary, **extra}
+            if not ok:
+                report["ok"] = False
+            _print_check(name, ok, summary)
+
+        if not json_output:
+            click.echo(f"Storage API URL: {url}")
+
+        # 1. Token identity (Keboola Storage API)
+        token_data: Optional[dict[str, Any]] = None
+        async with httpx.AsyncClient() as http_client:
+            try:
+                resp = await http_client.get(
+                    f"{url.rstrip('/')}/v2/storage/tokens/verify",
+                    headers={"x-storageapi-token": token},
+                    timeout=30.0,
+                )
+                if resp.status_code >= 400:
+                    body: dict[str, Any] = {}
+                    if "application/json" in resp.headers.get("content-type", ""):
+                        parsed = resp.json()
+                        if isinstance(parsed, dict):
+                            body = parsed
+                    if not body:
+                        body = {"error": resp.text}
+                    code = body.get("code") or f"http:{resp.status_code}"
+                    msg = body.get("error") or body.get("message") or resp.reason_phrase
+                    _record("token", False, f"HTTP {resp.status_code} {code}: {msg}")
+                else:
+                    parsed = resp.json()
+                    assert isinstance(parsed, dict), (
+                        "Storage API token verify must return JSON object"
+                    )
+                    token_data = parsed
+                    owner = token_data.get("owner") or {}
+                    project_id = owner.get("id")
+                    project_name = owner.get("name", "?")
+                    description = token_data.get("description", "?")
+                    is_master = token_data.get("isMasterToken", False)
+                    token_type = "master" if is_master else "scoped"
+                    summary = (
+                        f"project {project_id} ({project_name}), "
+                        f"token '{description}' [{token_type}]"
+                    )
+                    _record(
+                        "token",
+                        True,
+                        summary,
+                        project_id=project_id,
+                        project_name=project_name,
+                        token_description=description,
+                        is_master_token=is_master,
+                    )
+            except httpx.RequestError as e:
+                _record("token", False, f"connection error: {e}")
+
+        # If the token didn't verify, the remaining checks will all fail the same way.
+        # Bail early with a non-zero exit so this command stays useful in scripts.
+        if not token_data:
+            if json_output:
+                click.echo(json.dumps(report, indent=2, default=str))
+            sys.exit(1)
+
+        # 2. Build a KaiClient: respect --base-url for local dev; otherwise auto-discover.
+        client: Optional[KaiClient] = None
+        try:
+            if base_url:
+                client = KaiClient(storage_api_token=token, storage_api_url=url, base_url=base_url)
+                _record("service-discovery", True, f"using --base-url {base_url}")
+            else:
+                client = await KaiClient.from_storage_api(
+                    storage_api_token=token, storage_api_url=url
+                )
+                _record("service-discovery", True, f"kai-assistant at {client.base_url}")
+        except KaiError as e:
+            _record(
+                "service-discovery",
+                False,
+                _format_kai_error(e),
+                code=e.code,
+                message=e.message,
+            )
+
+        if client is None:
+            if json_output:
+                click.echo(json.dumps(report, indent=2, default=str))
+            sys.exit(1)
+
+        async with client:
+            # 3. Reachability (no auth needed)
+            try:
+                ping_resp = await client.ping()
+                _record("ping", True, f"server alive at {ping_resp.timestamp.isoformat()}")
+            except KaiError as e:
+                _record("ping", False, _format_kai_error(e), code=e.code, message=e.message)
+
+            try:
+                info_resp = await client.info()
+                _record(
+                    "info",
+                    True,
+                    f"{info_resp.app_name} v{info_resp.app_version} "
+                    f"(server v{info_resp.server_version}, uptime {info_resp.uptime:.0f}s)",
+                    server_version=info_resp.server_version,
+                )
+            except KaiError as e:
+                _record("info", False, _format_kai_error(e), code=e.code, message=e.message)
+
+            # 4. Authenticated probe + quota — the whole point of this command.
+            try:
+                usage = await client.get_usage()
+                remaining = usage.messages_limit - usage.messages_used
+                summary = (
+                    f"{usage.messages_used}/{usage.messages_limit} messages used "
+                    f"(resets {usage.reset_date.date().isoformat()}, {remaining} left)"
+                )
+                _record(
+                    "usage",
+                    True,
+                    summary,
+                    messages_used=usage.messages_used,
+                    messages_limit=usage.messages_limit,
+                    reset_date=usage.reset_date.isoformat(),
+                )
+            except KaiError as e:
+                # Specifically surface 429 rate_limit:chat cleanly — that's the symptom
+                # this whole command exists to diagnose.
+                _record("usage", False, _format_kai_error(e), code=e.code, message=e.message)
+
+        if json_output:
+            click.echo(json.dumps(report, indent=2, default=str))
+        elif report["ok"]:
+            click.echo()
+            click.echo(click.style("All checks passed.", fg="green"))
+        else:
+            click.echo()
+            click.echo(click.style("Some checks failed — see above.", fg="red"), err=True)
+
+        sys.exit(0 if report["ok"] else 1)
+
+    run_async(_verify())
+
+
+def _format_kai_error(e: KaiError) -> str:
+    """Render a KaiError as `code: message`, falling back to message-only."""
+    if e.code and e.message:
+        return f"{e.code}: {e.message}"
+    return e.message or str(e)
+
+
+@main.command()
 @click.option("-m", "--message", help="Send a single message instead of interactive mode")
 @click.option(
     "--chat-id",
@@ -200,9 +386,7 @@ def chat(
 
             if message:
                 # Single message mode
-                await send_and_display(
-                    client, chat_id, message, auto_approve, json_output
-                )
+                await send_and_display(client, chat_id, message, auto_approve, json_output)
             else:
                 # Interactive mode
                 if not json_output:
@@ -312,9 +496,8 @@ async def send_and_display(
     # and cleared when that tool completes)
     if pending_approval:
         # Get the tool name from tracking dict or pending_approval
-        approved_tool_name = (
-            pending_approval.tool_name
-            or current_tool_name.get(pending_approval.tool_call_id or "", "unknown")
+        approved_tool_name = pending_approval.tool_name or current_tool_name.get(
+            pending_approval.tool_call_id or "", "unknown"
         )
 
         # Determine which approval flow to use
