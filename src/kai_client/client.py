@@ -403,7 +403,7 @@ class KaiClient:
         branch_id: Optional[int] = None,
         hidden: bool = False,
         request_path: Optional[str] = None,
-        is_scheduled: Optional[bool] = None,
+        is_headless: Optional[bool] = None,
     ) -> AsyncIterator[SSEEvent]:
         """
         Send a message and stream the response.
@@ -418,10 +418,10 @@ class KaiClient:
             branch_id: Optional Keboola branch ID.
             hidden: Whether the message should be hidden.
             request_path: Optional path context for the request.
-            is_scheduled: Mark the run as scheduled/headless. The backend then
-                auto-approves tools configured as `always_ask` (while keeping
-                `blocked` tools denied), so unattended runs are not stalled
-                waiting for human approval.
+            is_headless: Mark the run as headless (no human in the loop, e.g. a
+                scheduled job). The backend then auto-approves tools configured
+                as `always_ask` (while keeping `blocked` tools denied), so
+                unattended runs are not stalled waiting for human approval.
 
         Yields:
             SSE events from the response stream.
@@ -454,7 +454,7 @@ class KaiClient:
             selected_chat_model="chat-model",
             selected_visibility_type=_normalize_visibility(visibility),
             branch_id=branch_id,
-            is_scheduled=is_scheduled,
+            is_headless=is_headless,
         )
 
         # Serialize with aliases
@@ -1149,7 +1149,7 @@ class KaiClient:
         chat_id: Optional[str] = None,
         visibility: str | VisibilityType = VisibilityType.PRIVATE,
         branch_id: Optional[int] = None,
-        is_scheduled: Optional[bool] = None,
+        is_headless: Optional[bool] = None,
     ) -> tuple[str, str]:
         """
         Send a message and collect the full text response.
@@ -1162,7 +1162,7 @@ class KaiClient:
             chat_id: Optional chat ID (generates new one if not provided).
             visibility: Chat visibility.
             branch_id: Optional Keboola branch ID.
-            is_scheduled: Mark the run as scheduled/headless (see send_message).
+            is_headless: Mark the run as headless / no human in the loop (see send_message).
 
         Returns:
             Tuple of (chat_id, response_text).
@@ -1183,7 +1183,7 @@ class KaiClient:
             text=text,
             visibility=visibility,
             branch_id=branch_id,
-            is_scheduled=is_scheduled,
+            is_headless=is_headless,
         ):
             if event.type == "text":
                 response_parts.append(event.text)  # type: ignore

@@ -178,7 +178,7 @@ class TestChatRequest:
         assert data["selectedVisibilityType"] == "private"
         assert data["branchId"] == 999
 
-    def test_is_scheduled_defaults_to_none(self):
+    def test_is_headless_defaults_to_none(self):
         request = ChatRequest(
             id="chat-123",
             message=MessageRequest(
@@ -189,11 +189,11 @@ class TestChatRequest:
             selectedChatModel="chat-model",
             selectedVisibilityType="private",
         )
-        assert request.is_scheduled is None
+        assert request.is_headless is None
         # Omitted from the payload when unset, keeping the request backward-compatible.
-        assert "isScheduled" not in request.model_dump(by_alias=True, exclude_none=True)
+        assert "isHeadless" not in request.model_dump(by_alias=True, exclude_none=True)
 
-    def test_is_scheduled_serializes_with_alias(self):
+    def test_is_headless_serializes_with_alias(self):
         request = ChatRequest(
             id="chat-123",
             message=MessageRequest(
@@ -203,10 +203,10 @@ class TestChatRequest:
             ),
             selectedChatModel="chat-model",
             selectedVisibilityType="private",
-            isScheduled=True,
+            isHeadless=True,
         )
-        assert request.is_scheduled is True
-        assert request.model_dump(by_alias=True)["isScheduled"] is True
+        assert request.is_headless is True
+        assert request.model_dump(by_alias=True)["isHeadless"] is True
 
 
 class TestPingResponse:
