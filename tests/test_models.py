@@ -178,6 +178,36 @@ class TestChatRequest:
         assert data["selectedVisibilityType"] == "private"
         assert data["branchId"] == 999
 
+    def test_is_scheduled_defaults_to_none(self):
+        request = ChatRequest(
+            id="chat-123",
+            message=MessageRequest(
+                id="msg-456",
+                role="user",
+                parts=[TextPart(type="text", text="Hello")],
+            ),
+            selectedChatModel="chat-model",
+            selectedVisibilityType="private",
+        )
+        assert request.is_scheduled is None
+        # Omitted from the payload when unset, keeping the request backward-compatible.
+        assert "isScheduled" not in request.model_dump(by_alias=True, exclude_none=True)
+
+    def test_is_scheduled_serializes_with_alias(self):
+        request = ChatRequest(
+            id="chat-123",
+            message=MessageRequest(
+                id="msg-456",
+                role="user",
+                parts=[TextPart(type="text", text="Test")],
+            ),
+            selectedChatModel="chat-model",
+            selectedVisibilityType="private",
+            isScheduled=True,
+        )
+        assert request.is_scheduled is True
+        assert request.model_dump(by_alias=True)["isScheduled"] is True
+
 
 class TestPingResponse:
     """Tests for PingResponse model."""
