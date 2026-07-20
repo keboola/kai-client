@@ -108,6 +108,29 @@ class MessageRequest(BaseModel):
     metadata: Optional[MessageMetadata] = None
 
 
+class ToolRestrictions(BaseModel):
+    """Restrictions on which tools the assistant may use during a chat.
+
+    All fields are optional. When sent on ``POST /api/chat``, the backend
+    applies them as follows:
+
+    - ``allowed_tools``: allowlist — only these tools may be used.
+    - ``disallowed_tools``: denylist — these tools may not be used.
+    - ``read_only_mode``: when ``True``, only read-only tools may be used.
+
+    Note:
+        Restrictions are **first-message-wins**: the backend persists them
+        from the first message of a chat and silently ignores
+        ``toolRestrictions`` sent on follow-up messages of the same chat.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    allowed_tools: Optional[list[str]] = Field(default=None, alias="allowedTools")
+    disallowed_tools: Optional[list[str]] = Field(default=None, alias="disallowedTools")
+    read_only_mode: Optional[bool] = Field(default=None, alias="readOnlyMode")
+
+
 class ChatRequest(BaseModel):
     """Request body for creating/continuing a chat."""
 
@@ -118,6 +141,9 @@ class ChatRequest(BaseModel):
     selected_chat_model: str = Field(alias="selectedChatModel")
     selected_visibility_type: str = Field(alias="selectedVisibilityType")
     branch_id: Optional[int] = Field(default=None, alias="branchId")
+    tool_restrictions: Optional[ToolRestrictions] = Field(
+        default=None, alias="toolRestrictions"
+    )
 
 
 class VoteRequest(BaseModel):

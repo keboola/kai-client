@@ -20,6 +20,7 @@ from kai_client.models import (
     TextPart,
     ToolCallEvent,
     ToolCallPart,
+    ToolRestrictions,
     ToolResultPart,
     Vote,
     VoteRequest,
@@ -177,6 +178,107 @@ class TestChatRequest:
         assert data["selectedChatModel"] == "chat-model"
         assert data["selectedVisibilityType"] == "private"
         assert data["branchId"] == 999
+
+    def test_tool_restrictions_default_none(self):
+        request = ChatRequest(
+            id="chat-123",
+            message=MessageRequest(
+                id="msg-456",
+                role="user",
+                parts=[TextPart(type="text", text="Hello")],
+            ),
+            selectedChatModel="chat-model",
+            selectedVisibilityType="private",
+        )
+        assert request.tool_restrictions is None
+        # Omitted from the payload when not set
+        data = request.model_dump(by_alias=True, exclude_none=True)
+        assert "toolRestrictions" not in data
+
+    def test_with_tool_restrictions(self):
+        request = ChatRequest(
+            id="chat-123",
+            message=MessageRequest(
+                id="msg-456",
+                role="user",
+                parts=[TextPart(type="text", text="Test")],
+            ),
+            selectedChatModel="chat-model",
+            selectedVisibilityType="private",
+            toolRestrictions=ToolRestrictions(
+                allowedTools=["list_tables"],
+                disallowedTools=["run_job"],
+                readOnlyMode=True,
+            ),
+        )
+        assert request.tool_restrictions is not None
+        assert request.tool_restrictions.allowed_tools == ["list_tables"]
+        assert request.tool_restrictions.disallowed_tools == ["run_job"]
+        assert request.tool_restrictions.read_only_mode is True
+
+    def test_tool_restrictions_serialization_aliases(self):
+        request = ChatRequest(
+            id="chat-123",
+            message=MessageRequest(
+                id="msg-456",
+                role="user",
+                parts=[TextPart(type="text", text="Test")],
+            ),
+            selectedChatModel="chat-model",
+            selectedVisibilityType="private",
+            toolRestrictions=ToolRestrictions(
+                allowedTools=["list_tables", "get_table_detail"],
+                readOnlyMode=True,
+            ),
+        )
+        data = request.model_dump(by_alias=True, exclude_none=True)
+        assert data["toolRestrictions"]["allowedTools"] == [
+            "list_tables",
+            "get_table_detail",
+        ]
+        assert data["toolRestrictions"]["readOnlyMode"] is True
+        # Unset sub-fields are omitted
+        assert "disallowedTools" not in data["toolRestrictions"]
+
+
+class TestToolRestrictions:
+    """Tests for ToolRestrictions model."""
+
+    def test_all_fields_optional(self):
+        restrictions = ToolRestrictions()
+        assert restrictions.allowed_tools is None
+        assert restrictions.disallowed_tools is None
+        assert restrictions.read_only_mode is None
+
+    def test_snake_case_construction(self):
+        restrictions = ToolRestrictions(
+            allowed_tools=["a"],
+            disallowed_tools=["b"],
+            read_only_mode=False,
+        )
+        assert restrictions.allowed_tools == ["a"]
+        assert restrictions.disallowed_tools == ["b"]
+        assert restrictions.read_only_mode is False
+
+    def test_serializes_to_camel_case(self):
+        restrictions = ToolRestrictions(
+            allowed_tools=["a"],
+            disallowed_tools=["b"],
+            read_only_mode=True,
+        )
+        data = restrictions.model_dump(by_alias=True)
+        assert data == {
+            "allowedTools": ["a"],
+            "disallowedTools": ["b"],
+            "readOnlyMode": True,
+        }
+
+    def test_empty_sub_fields_omitted(self):
+        restrictions = ToolRestrictions(read_only_mode=True)
+        data = restrictions.model_dump(by_alias=True, exclude_none=True)
+        assert data == {"readOnlyMode": True}
+        assert "allowedTools" not in data
+        assert "disallowedTools" not in data
 
 
 class TestPingResponse:
