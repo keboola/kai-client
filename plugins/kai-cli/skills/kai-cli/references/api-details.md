@@ -94,6 +94,31 @@ async for event in client.send_message(
     # Process events
 ```
 
+#### Restricting Tool Usage
+
+Pass `tool_restrictions` to limit which tools the assistant may use. All three
+fields are optional and independent:
+
+```python
+from kai_client import ToolRestrictions
+
+async for event in client.send_message(
+    chat_id="uuid",
+    text="Show me my tables",
+    tool_restrictions=ToolRestrictions(
+        allowed_tools=["list_tables", "get_table_detail"],  # allowlist
+        disallowed_tools=["run_job"],                        # denylist
+        read_only_mode=True,                                 # read-only tools only
+    ),
+):
+    # Process events
+```
+
+This serializes to `toolRestrictions: {allowedTools, disallowedTools, readOnlyMode}`
+in the `POST /api/chat` request body. Restrictions are **first-message-wins**: the
+backend persists them from the first message of a chat and ignores
+`toolRestrictions` sent on follow-up messages of the same chat.
+
 ### Tool Approval
 
 When the AI needs to execute operations, it sends a `ToolCallEvent` with `state="input-available"`:
@@ -218,6 +243,18 @@ Messages can contain multiple parts:
 
 - `private`: Chat visible only to creator
 - `public`: Chat visible to all project members
+
+### Tool Restrictions
+
+`ToolRestrictions` (passed via `send_message(tool_restrictions=...)`) has three
+optional fields, serialized under `toolRestrictions` on `POST /api/chat`:
+
+- `allowed_tools` (`allowedTools`): allowlist — only these tools may be used
+- `disallowed_tools` (`disallowedTools`): denylist — these tools may not be used
+- `read_only_mode` (`readOnlyMode`): when `True`, only read-only tools may be used
+
+Restrictions are **first-message-wins**: they are persisted from the first
+message of a chat and ignored on follow-up messages of the same chat.
 
 ### Vote Types
 
