@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
-from kai_client import __version__
+from kai_client import KaiBackend, __version__
 from kai_client.cli import get_client, get_env_or_error, main, run_async
 from kai_client.models import (
     Chat,
@@ -793,12 +793,13 @@ class TestGetClientFunction:
 
     @pytest.mark.asyncio
     async def test_get_client_auto_discover(self, mock_env):
-        """Test client creation with auto-discovery (production mode)."""
+        """Auto-discovery defaults to the agent backend."""
         ctx = MagicMock()
         ctx.obj = {
             "token": "test-token",
             "url": "https://connection.keboola.com",
             "base_url": None,
+            "service": "agent",
         }
 
         with patch("kai_client.cli.KaiClient.from_storage_api") as mock_factory:
@@ -810,5 +811,44 @@ class TestGetClientFunction:
             mock_factory.assert_called_once_with(
                 storage_api_token="test-token",
                 storage_api_url="https://connection.keboola.com",
+                service=KaiBackend.AGENT,
             )
             assert client == mock_client
+
+    @pytest.mark.asyncio
+    async def test_get_client_service_assistant(self, mock_env):
+        """service=assistant maps to KaiBackend.ASSISTANT."""
+        ctx = MagicMock()
+        ctx.obj = {
+            "token": "test-token",
+            "url": "https://connection.keboola.com",
+            "base_url": None,
+            "service": "assistant",
+        }
+
+        with patch("kai_client.cli.KaiClient.from_storage_api") as mock_factory:
+            mock_factory.return_value = MagicMock()
+
+            await get_client(ctx)
+
+            mock_factory.assert_called_once_with(
+                storage_api_token="test-token",
+                storage_api_url="https://connection.keboola.com",
+                service=KaiBackend.ASSISTANT,
+            )
+
+    @pytest.mark.asyncio
+    async def test_get_client_base_url_ignores_service(self, mock_env):
+        """--base-url bypasses discovery regardless of service."""
+        ctx = MagicMock()
+        ctx.obj = {
+            "token": "test-token",
+            "url": "https://connection.keboola.com",
+            "base_url": "http://localhost:3000",
+            "service": "assistant",
+        }
+
+        with patch("kai_client.cli.KaiClient.from_storage_api") as mock_factory:
+            client = await get_client(ctx)
+            mock_factory.assert_not_called()
+            assert client.base_url == "http://localhost:3000"

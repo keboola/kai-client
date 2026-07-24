@@ -15,7 +15,7 @@ _env_local = Path.cwd() / ".env.local"
 if _env_local.exists():
     load_dotenv(_env_local)
 
-from kai_client import KaiClient, __version__  # noqa: E402
+from kai_client import KaiBackend, KaiClient, __version__  # noqa: E402
 from kai_client.models import ToolApprovalRequestEvent  # noqa: E402
 from kai_client.types import VoteType  # noqa: E402
 
@@ -52,8 +52,15 @@ def run_async(coro):
     envvar="KAI_BASE_URL",
     help="Kai API base URL for local development (default: auto-discover)",
 )
+@click.option(
+    "--service",
+    type=click.Choice(["agent", "assistant"]),
+    default="agent",
+    envvar="KAI_SERVICE",
+    help="Which Kai backend to auto-discover (default: agent). Ignored with --base-url.",
+)
 @click.pass_context
-def main(ctx, token: Optional[str], url: Optional[str], base_url: Optional[str]):
+def main(ctx, token: Optional[str], url: Optional[str], base_url: Optional[str], service: str):
     """
     Kai CLI - Command-line interface for the Keboola AI Assistant.
 
@@ -81,6 +88,7 @@ def main(ctx, token: Optional[str], url: Optional[str], base_url: Optional[str])
     ctx.obj["token"] = token
     ctx.obj["url"] = url
     ctx.obj["base_url"] = base_url
+    ctx.obj["service"] = service
 
 
 async def get_client(ctx) -> KaiClient:
@@ -96,12 +104,15 @@ async def get_client(ctx) -> KaiClient:
             storage_api_url=url,
             base_url=base_url,
         )
-    else:
-        # Production mode - auto-discover URL
-        return await KaiClient.from_storage_api(
-            storage_api_token=token,
-            storage_api_url=url,
-        )
+
+    # Production mode - auto-discover URL
+    service_map = {"agent": KaiBackend.AGENT, "assistant": KaiBackend.ASSISTANT}
+    service = service_map[ctx.obj.get("service") or "agent"]
+    return await KaiClient.from_storage_api(
+        storage_api_token=token,
+        storage_api_url=url,
+        service=service,
+    )
 
 
 @main.command()
