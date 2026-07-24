@@ -17,6 +17,13 @@ class VoteType(str, Enum):
     DOWN = "down"
 
 
+class KaiBackend(str, Enum):
+    """Selectable Keboola AI backend services (Storage API service ids)."""
+
+    AGENT = "kai-agent"          # modern agent backend (default)
+    ASSISTANT = "kai-assistant"  # legacy backend (single-tenant; being retired)
+
+
 class JobStatus(str, Enum):
     """Job processing status."""
 
