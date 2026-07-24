@@ -35,7 +35,7 @@ async def main():
         print("Error: STORAGE_API_TOKEN and STORAGE_API_URL must be set in .env.local")
         return
 
-    print("Discovering kai-assistant URL...")
+    print("Discovering kai-agent URL...")
     client = await KaiClient.from_storage_api(
         storage_api_token=token,
         storage_api_url=url,

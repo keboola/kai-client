@@ -10,16 +10,25 @@ All Kai API requests require two headers:
 
 ### Production Mode (Auto-Discovery)
 
-The Kai client automatically discovers the Kai API URL from the Keboola stack:
+The Kai client automatically discovers the Kai API URL from the Keboola stack
+(defaults to the **kai-agent** backend):
 
 ```python
-from kai_client import KaiClient
+from kai_client import KaiClient, KaiBackend
 
+# Defaults to kai-agent
 async with await KaiClient.from_storage_api(
     storage_api_token="your-token",
-    storage_api_url="https://connection.keboola.com"
+    storage_api_url="https://connection.keboola.com",
 ) as client:
     response = await client.ping()
+
+# Legacy backend (single-tenant deployments only)
+client = await KaiClient.from_storage_api(
+    storage_api_token="your-token",
+    storage_api_url="https://connection.keboola.com",
+    service=KaiBackend.ASSISTANT,
+)
 ```
 
 ### Local Development Mode
@@ -42,6 +51,11 @@ export KAI_BASE_URL="http://localhost:3000"
 Or CLI flag:
 ```bash
 kai --base-url http://localhost:3000 chat -m "Hello"
+```
+
+Select the backend for auto-discovery (default `agent`):
+```bash
+kai --service assistant chat -m "Hello"   # legacy backend
 ```
 
 ## API Methods

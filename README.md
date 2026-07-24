@@ -41,7 +41,7 @@ import asyncio
 from kai_client import KaiClient
 
 async def main():
-    # Production: Auto-discover the kai-assistant URL from your Keboola stack
+    # Production: Auto-discover the kai-agent URL from your Keboola stack
     client = await KaiClient.from_storage_api(
         storage_api_token="your-keboola-token",
         storage_api_url="https://connection.keboola.com"  # Your stack URL
@@ -191,7 +191,7 @@ client = KaiClient(
     base_url="http://localhost:3000"
 )
 
-# Production (auto-discovers kai-assistant URL)
+# Production (auto-discovers kai-agent URL)
 client = await KaiClient.from_storage_api(
     storage_api_token="your-token",
     storage_api_url="https://connection.keboola.com"
@@ -400,14 +400,33 @@ The main client class for interacting with the Kai API.
 
 ```python
 client = await KaiClient.from_storage_api(
-    storage_api_token: str,      # Keboola Storage API token
-    storage_api_url: str,        # Keboola connection URL (e.g., https://connection.keboola.com)
-    timeout: float = 300.0,      # Request timeout in seconds
+    storage_api_token: str,        # Keboola Storage API token
+    storage_api_url: str,          # Keboola connection URL (e.g., https://connection.keboola.com)
+    service: KaiBackend = KaiBackend.AGENT,  # Backend to discover (keyword-only)
+    timeout: float = 300.0,        # Request timeout in seconds
     stream_timeout: float = 600.0  # Streaming timeout in seconds
 )
 ```
 
-This method auto-discovers the kai-assistant service URL from your Keboola stack.
+This method auto-discovers the **kai-agent** service URL from your Keboola stack
+(the modern agent backend). To target the legacy `kai-assistant` backend
+(single-tenant deployments only), pass `service=KaiBackend.ASSISTANT`.
+
+#### Backend Support
+
+`kai-client` targets the **kai-agent** backend by default. The following methods
+are supported against kai-agent:
+
+`ping`, `info`, `send_message`, `chat`, `submit_approval`, `get_chat`,
+`delete_chat`, `get_history` / `get_all_history`, `get_votes` / `vote` /
+`upvote` / `downvote`, `get_usage`, `get_settings` / `update_settings` /
+`get_user_settings` / `update_user_settings`, `get_tools`, `get_suggestions`.
+
+These methods use the older Vercel-AI-SDK-v6 / tool-result protocols and are
+**not supported by kai-agent** (kept only for the legacy backend):
+`send_tool_approval_response`, `approve_tool`, `reject_tool`, `send_tool_result`,
+`confirm_tool`, `deny_tool`, `resume_stream`. Use `submit_approval` for tool
+approvals on kai-agent.
 
 #### Constructor (For Local Development)
 
