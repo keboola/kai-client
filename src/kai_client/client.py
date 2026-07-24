@@ -122,6 +122,8 @@ class KaiClient:
             )
             ```
         """
+        service_id = service.value if isinstance(service, KaiBackend) else service
+
         async with httpx.AsyncClient() as http_client:
             try:
                 response = await http_client.get(
@@ -133,7 +135,7 @@ class KaiClient:
                 data = response.json()
             except httpx.HTTPStatusError as e:
                 raise KaiError(
-                    message=f"Failed to discover kai-assistant URL: HTTP {e.response.status_code}",
+                    message=f"Failed to discover {service_id} URL: HTTP {e.response.status_code}",
                     code="discovery:http_error",
                 ) from e
             except httpx.RequestError as e:
@@ -143,7 +145,6 @@ class KaiClient:
                 ) from e
 
         services = data.get("services", [])
-        service_id = service.value if isinstance(service, KaiBackend) else service
         kai_service = next(
             (s for s in services if s.get("id") == service_id),
             None,

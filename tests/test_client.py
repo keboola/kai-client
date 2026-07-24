@@ -876,7 +876,7 @@ class TestFromStorageApi:
 
     @pytest.mark.asyncio
     async def test_http_error(self, httpx_mock: HTTPXMock):
-        """Error when Storage API returns HTTP error."""
+        """Error when Storage API returns HTTP error; message names the requested service."""
         httpx_mock.add_response(
             url="https://connection.keboola.com/v2/storage",
             status_code=401,
@@ -889,6 +889,27 @@ class TestFromStorageApi:
                 storage_api_url="https://connection.keboola.com",
             )
 
+        assert "kai-agent" in str(exc_info.value)
+        assert "HTTP 401" in str(exc_info.value)
+        assert exc_info.value.code == "discovery:http_error"
+
+    @pytest.mark.asyncio
+    async def test_http_error_names_explicit_service(self, httpx_mock: HTTPXMock):
+        """HTTP error message names kai-assistant when explicitly requested."""
+        httpx_mock.add_response(
+            url="https://connection.keboola.com/v2/storage",
+            status_code=401,
+            json={"message": "Unauthorized"},
+        )
+
+        with pytest.raises(KaiError) as exc_info:
+            await KaiClient.from_storage_api(
+                storage_api_token="bad-token",
+                storage_api_url="https://connection.keboola.com",
+                service=KaiBackend.ASSISTANT,
+            )
+
+        assert "kai-assistant" in str(exc_info.value)
         assert "HTTP 401" in str(exc_info.value)
         assert exc_info.value.code == "discovery:http_error"
 
