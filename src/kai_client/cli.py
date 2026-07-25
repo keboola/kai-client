@@ -365,6 +365,11 @@ async def _send_and_display_agent(
     POSTed to the approval endpoint. The decision therefore has to be made from
     inside the streaming loop; the same stream afterwards carries the
     post-approval events (tool output, further text, finish).
+
+    Tools the backend executes without asking (read-only ones, or ones the user
+    marked ``always_allow``) also pass through ``input-available``, so this may
+    prompt for a tool that needed no approval. The resulting POST then answers
+    nothing and is reported as non-fatal rather than aborting the stream.
     """
     current_tool_name: dict[str, str] = {}
     decided: set[str] = set()
