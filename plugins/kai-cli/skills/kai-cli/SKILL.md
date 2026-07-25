@@ -29,6 +29,20 @@ Or pass credentials via CLI flags:
 kai --token YOUR_TOKEN --url https://connection.keboola.com COMMAND
 ```
 
+### Backend Selection
+
+Keboola exposes two AI backends. The CLI auto-discovers **kai-agent** (the
+modern backend) by default; `--service assistant` selects the legacy
+kai-assistant backend, which only exists on single-tenant deployments:
+
+```bash
+kai chat -m "Hello"                     # kai-agent (default)
+kai --service assistant chat -m "Hello" # legacy backend
+```
+
+The flag can also be set with `KAI_SERVICE=agent|assistant` and is ignored when
+`--base-url` is used for local development.
+
 ### Installation
 
 Install from PyPI or run from source:

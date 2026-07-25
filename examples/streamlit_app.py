@@ -20,7 +20,7 @@ from pathlib import Path
 import streamlit as st
 from dotenv import load_dotenv
 
-from kai_client import KaiClient
+from kai_client import KaiBackend, KaiClient
 
 # Load credentials from .env.local (same as the kai CLI)
 _env_local = Path(__file__).resolve().parent.parent / ".env.local"
@@ -103,10 +103,17 @@ def run_async(coro):
 
 
 async def get_client() -> KaiClient:
-    """Create a KaiClient with auto-discovered URL."""
+    """Create a KaiClient with auto-discovered URL.
+
+    Pinned to the legacy kai-assistant backend because the approval handling
+    below uses approve_tool / reject_tool, which kai-agent does not support.
+    Streamlit's rerun model cannot hold the send_message stream open across the
+    approve/deny button click, which is what kai-agent's submit_approval needs.
+    """
     return await KaiClient.from_storage_api(
         storage_api_token=token,
         storage_api_url=api_url,
+        service=KaiBackend.ASSISTANT,
     )
 
 

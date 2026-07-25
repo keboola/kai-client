@@ -58,6 +58,28 @@ Select the backend for auto-discovery (default `agent`):
 kai --service assistant chat -m "Hello"   # legacy backend
 ```
 
+The flag also reads the `KAI_SERVICE` environment variable and accepts the full
+service ids (`kai-agent`, `kai-assistant`). It is ignored when `--base-url` is
+given.
+
+### Backend Support
+
+Supported against **kai-agent** (the default): `ping`, `info`, `send_message`,
+`chat`, `submit_approval`, `get_chat`, `delete_chat`, `get_history` /
+`get_all_history`, `get_votes` / `vote` / `upvote` / `downvote`, `get_usage`,
+`get_settings` / `update_settings` / `get_user_settings` /
+`update_user_settings`, `get_tools`, `get_suggestions`.
+
+**Not supported by kai-agent** — these use the older Vercel-AI-SDK-v6 /
+tool-result protocols and only work against the legacy kai-assistant backend:
+`send_tool_approval_response`, `approve_tool`, `reject_tool`, `send_tool_result`,
+`confirm_tool`, `deny_tool`, `resume_stream`.
+
+This split is derived from the kai-agent route surface and the protocol notes
+carried by the methods themselves; only `ping` has been confirmed against a live
+kai-agent deployment, so treat individual entries as expected rather than
+individually verified.
+
 ## API Methods
 
 ### Health & Info
@@ -110,25 +132,32 @@ async for event in client.send_message(
 
 ### Tool Approval
 
-When the AI needs to execute operations, it sends a `ToolCallEvent` with `state="input-available"`:
+When the AI needs to execute a write operation, it sends a `ToolCallEvent` with
+`state="input-available"`. On **kai-agent** the stream stays open and blocked
+until the decision is submitted, so call `submit_approval` from inside the
+streaming loop — the same stream then continues with the tool output:
 
 ```python
-# Approve the tool call
-async for event in client.confirm_tool(
-    chat_id=chat_id,
-    tool_call_id=tool_event.tool_call_id,
-    tool_name=tool_event.tool_name,
-):
-    # Process results
-
-# Deny the tool call
-async for event in client.deny_tool(
-    chat_id=chat_id,
-    tool_call_id=tool_event.tool_call_id,
-    tool_name=tool_event.tool_name,
-):
-    # Process denial response
+async for event in client.send_message(chat_id, "Create a bucket"):
+    if event.type == "tool-call" and event.state == "input-available":
+        await client.submit_approval(
+            chat_id=chat_id,
+            tool_use_id=event.tool_call_id,  # the toolCallId of that event
+            approved=True,                   # False to deny
+            # reason="Not right now",
+        )
 ```
+
+`submit_approval` is a plain POST (not a stream) and returns an
+`ApprovalResponse`. Read-only tools the backend runs on its own also pass
+through `input-available`; submitting an approval for one of them returns a
+"no pending approval" error that is safe to ignore.
+
+On the legacy **kai-assistant** backend the first stream ends instead, and the
+reply is sent with `approve_tool` / `reject_tool` (v6 flow, using the
+`approval_id` from the `tool-approval-request` event) or `confirm_tool` /
+`deny_tool` (older tool-result flow). Each of those returns a new stream. None
+of them work against kai-agent.
 
 ### History Management
 

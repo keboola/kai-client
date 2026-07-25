@@ -17,7 +17,7 @@ if env_file.exists():
             key, value = line.split("=", 1)
             os.environ[key.strip()] = value.strip()
 
-from kai_client import KaiClient  # noqa: E402
+from kai_client import KaiBackend, KaiClient  # noqa: E402
 from kai_client.models import ToolCallEvent  # noqa: E402
 
 
@@ -81,9 +81,14 @@ async def main():
     print(f"Storage API URL: {url}")
     print()
 
+    # This script exercises the v6 (approve_tool / reject_tool) and legacy
+    # (confirm_tool / deny_tool) approval flows, which are only supported by the
+    # kai-assistant backend — hence the explicit service pin instead of the
+    # kai-agent default. kai-agent approvals go through submit_approval.
     client = await KaiClient.from_storage_api(
         storage_api_token=token,
         storage_api_url=url,
+        service=KaiBackend.ASSISTANT,
     )
     print(f"Kai URL: {client.base_url}")
     print()
