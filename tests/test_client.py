@@ -56,6 +56,16 @@ class TestKaiClientInit:
         assert client.timeout == 60.0
         assert client.stream_timeout == 120.0
 
+    def test_direct_construction_has_unknown_backend(self):
+        """Direct construction leaves backend None — the backend behind an
+        arbitrary base_url is unknown (only discovery can record it)."""
+        client = KaiClient(
+            storage_api_token="token",
+            storage_api_url="https://connection.keboola.com",
+            base_url="http://localhost:3000",
+        )
+        assert client.backend is None
+
 
 class TestUUIDGeneration:
     """Tests for UUID generation methods."""
@@ -135,6 +145,28 @@ class TestInfo:
         assert response.app_name == "kai-backend"
         assert response.app_version == "1.0.0"
         assert len(response.connected_mcp) == 1
+
+    @pytest.mark.asyncio
+    async def test_info_sends_auth_headers(self, client: KaiClient, httpx_mock: HTTPXMock):
+        """Info must send auth headers: /api requires credentials on kai-agent."""
+        httpx_mock.add_response(
+            url="http://localhost:3000/api",
+            json={
+                "timestamp": "2025-12-24T16:24:10.641Z",
+                "uptime": 12345.67,
+                "appName": "kai-backend",
+                "appVersion": "1.0.0",
+                "serverVersion": "2.0.0",
+                "connectedMcp": [],
+            },
+        )
+
+        async with client:
+            await client.info()
+
+        request = httpx_mock.get_request()
+        assert request.headers["x-storageapi-token"] == "test-token"
+        assert request.headers["x-storageapi-url"] == "https://connection.test.keboola.com"
 
 
 class TestGetChat:

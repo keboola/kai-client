@@ -329,12 +329,17 @@ class KaiClient:
         return str(uuid.uuid4())
 
     # =========================================================================
-    # Health & Info Endpoints (No Auth Required)
+    # Health & Info Endpoints
     # =========================================================================
+    # /ping is public on both backends. /api requires credentials on kai-agent
+    # (it returns 401 "Missing credentials" without them) and ignores them on
+    # kai-assistant, so info() always sends the auth headers.
 
     async def ping(self) -> PingResponse:
         """
         Check if the server is alive.
+
+        This endpoint is public on both backends, so no credentials are sent.
 
         Returns:
             PingResponse with the server timestamp.
@@ -346,10 +351,13 @@ class KaiClient:
         """
         Get server information including MCP connection status.
 
+        Sends the authentication headers: the kai-agent backend requires
+        credentials on ``/api``, and kai-assistant accepts them harmlessly.
+
         Returns:
             InfoResponse with server details.
         """
-        response = await self._request("GET", "/api", auth=False)
+        response = await self._request("GET", "/api")
         return InfoResponse.model_validate(response.json())
 
     # =========================================================================
