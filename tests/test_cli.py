@@ -6,9 +6,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
-from kai_client import KaiBackend, __version__
+from kai_client import KaiBackend, KaiError, __version__
 from kai_client.cli import get_client, get_env_or_error, main, run_async
 from kai_client.models import (
+    ApprovalResponse,
     Chat,
     ChatDetail,
     FinishEvent,
@@ -225,8 +226,10 @@ class TestChatCommand:
                 assert "type" in parsed
 
     def test_chat_with_tool_call_auto_approve(self, runner, mock_env):
+        """Legacy (kai-assistant) path: auto-approve replies via confirm_tool."""
         with patch("kai_client.cli.get_client") as mock_get_client:
             mock_client = AsyncMock()
+            mock_client.backend = KaiBackend.ASSISTANT
             mock_client.new_chat_id = MagicMock(return_value="test-chat-id")
 
             async def mock_send_message(chat_id, message):
@@ -307,6 +310,7 @@ class TestChatCommand:
         """
         with patch("kai_client.cli.get_client") as mock_get_client:
             mock_client = AsyncMock()
+            mock_client.backend = KaiBackend.ASSISTANT
             mock_client.new_chat_id = MagicMock(return_value="test-chat-id")
 
             async def mock_send_message(chat_id, message):
@@ -357,6 +361,7 @@ class TestChatCommand:
         """
         with patch("kai_client.cli.get_client") as mock_get_client:
             mock_client = AsyncMock()
+            mock_client.backend = KaiBackend.ASSISTANT
             mock_client.new_chat_id = MagicMock(return_value="test-chat-id")
 
             from kai_client.models import StepStartEvent
@@ -440,6 +445,7 @@ class TestChatCommand:
         """
         with patch("kai_client.cli.get_client") as mock_get_client:
             mock_client = AsyncMock()
+            mock_client.backend = KaiBackend.ASSISTANT
             mock_client.new_chat_id = MagicMock(return_value="test-chat-id")
 
             async def mock_send_message(chat_id, message):
@@ -484,6 +490,254 @@ class TestChatCommand:
             assert "[Auto-approving...]" not in result.output
             # confirm_tool should not have been called
             mock_client.confirm_tool.assert_not_called()
+
+
+class TestChatApprovalFlowSelection:
+    """Tests for choosing the approval protocol from client.backend."""
+
+    @staticmethod
+    def _agent_client(order: list):
+        """Build a mock kai-agent client whose stream continues after approval."""
+        mock_client = AsyncMock()
+        mock_client.backend = KaiBackend.AGENT
+        mock_client.new_chat_id = MagicMock(return_value="test-chat-id")
+        mock_client.submit_approval = AsyncMock(
+            return_value=ApprovalResponse(
+                success=True, toolUseId="tool-123", approved=True
+            )
+        )
+
+        async def mock_send_message(chat_id, message):
+            yield ToolCallEvent(
+                type="tool-call",
+                toolCallId="tool-123",
+                toolName="create_bucket",
+                state="input-available",
+                input={"name": "test"},
+            )
+            # Reaching here proves the approval was submitted while this same
+            # stream was still open (the kai-agent contract).
+            order.append(("stream-resumed", mock_client.submit_approval.await_count))
+            yield ToolCallEvent(
+                type="tool-call",
+                toolCallId="tool-123",
+                toolName="create_bucket",
+                state="output-available",
+                output={"id": "in.c-test"},
+            )
+            yield TextEvent(type="text", text="Bucket created!")
+            yield FinishEvent(type="finish", finishReason="stop")
+
+        mock_client.send_message = mock_send_message
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        return mock_client
+
+    def test_agent_auto_approve_calls_submit_approval(self, runner, mock_env):
+        """kai-agent + --auto-approve: submit_approval(approved=True), no prompt."""
+        order: list = []
+        with patch("kai_client.cli.get_client") as mock_get_client:
+            mock_client = self._agent_client(order)
+            mock_get_client.return_value = mock_client
+
+            result = runner.invoke(main, ["chat", "--auto-approve", "-m", "Create bucket"])
+
+            assert result.exit_code == 0
+            mock_client.submit_approval.assert_awaited_once_with(
+                chat_id="test-chat-id",
+                tool_use_id="tool-123",
+                approved=True,
+            )
+            # Submitted mid-stream, and the rest of the stream was consumed
+            assert order == [("stream-resumed", 1)]
+            assert "[Auto-approving...]" in result.output
+            assert "Approve this tool call?" not in result.output
+            assert "Bucket created!" in result.output
+
+    def test_agent_interactive_approve(self, runner, mock_env):
+        """kai-agent without --auto-approve: prompt, then approve."""
+        order: list = []
+        with patch("kai_client.cli.get_client") as mock_get_client:
+            mock_client = self._agent_client(order)
+            mock_get_client.return_value = mock_client
+
+            result = runner.invoke(main, ["chat", "-m", "Create bucket"], input="y\n")
+
+            assert result.exit_code == 0
+            assert "Approve this tool call?" in result.output
+            mock_client.submit_approval.assert_awaited_once_with(
+                chat_id="test-chat-id",
+                tool_use_id="tool-123",
+                approved=True,
+            )
+
+    def test_agent_interactive_deny(self, runner, mock_env):
+        """kai-agent: declining the prompt submits approved=False."""
+        order: list = []
+        with patch("kai_client.cli.get_client") as mock_get_client:
+            mock_client = self._agent_client(order)
+            mock_get_client.return_value = mock_client
+
+            result = runner.invoke(main, ["chat", "-m", "Create bucket"], input="n\n")
+
+            assert result.exit_code == 0
+            mock_client.submit_approval.assert_awaited_once_with(
+                chat_id="test-chat-id",
+                tool_use_id="tool-123",
+                approved=False,
+            )
+
+    def test_agent_does_not_use_v6_methods(self, runner, mock_env):
+        """kai-agent must not fall back to the v6/legacy approval methods."""
+        order: list = []
+        with patch("kai_client.cli.get_client") as mock_get_client:
+            mock_client = self._agent_client(order)
+            mock_client.approve_tool = MagicMock()
+            mock_client.confirm_tool = MagicMock()
+            mock_get_client.return_value = mock_client
+
+            result = runner.invoke(main, ["chat", "--auto-approve", "-m", "Create bucket"])
+
+            assert result.exit_code == 0
+            mock_client.approve_tool.assert_not_called()
+            mock_client.confirm_tool.assert_not_called()
+
+    def test_agent_submit_approval_error_is_not_fatal(self, runner, mock_env):
+        """A rejected approval POST is reported but the stream keeps going."""
+        order: list = []
+        with patch("kai_client.cli.get_client") as mock_get_client:
+            mock_client = self._agent_client(order)
+            mock_client.submit_approval = AsyncMock(
+                side_effect=KaiError(message="No pending approval", code="not_found:api")
+            )
+            mock_get_client.return_value = mock_client
+
+            result = runner.invoke(main, ["chat", "--auto-approve", "-m", "Create bucket"])
+
+            assert result.exit_code == 0
+            assert "No pending approval" in result.output
+            assert "Bucket created!" in result.output
+
+    def test_unknown_backend_uses_agent_flow(self, runner, mock_env):
+        """backend=None (the --base-url local-dev path) uses submit_approval."""
+        order: list = []
+        with patch("kai_client.cli.get_client") as mock_get_client:
+            mock_client = self._agent_client(order)
+            mock_client.backend = None
+            mock_get_client.return_value = mock_client
+
+            result = runner.invoke(main, ["chat", "--auto-approve", "-m", "Create bucket"])
+
+            assert result.exit_code == 0
+            mock_client.submit_approval.assert_awaited_once_with(
+                chat_id="test-chat-id",
+                tool_use_id="tool-123",
+                approved=True,
+            )
+
+    def test_assistant_backend_uses_v6_flow(self, runner, mock_env):
+        """kai-assistant keeps the legacy flow and never calls submit_approval."""
+        with patch("kai_client.cli.get_client") as mock_get_client:
+            mock_client = AsyncMock()
+            mock_client.backend = KaiBackend.ASSISTANT
+            mock_client.new_chat_id = MagicMock(return_value="test-chat-id")
+            mock_client.submit_approval = AsyncMock()
+
+            async def mock_send_message(chat_id, message):
+                yield ToolCallEvent(
+                    type="tool-call",
+                    toolCallId="tool-123",
+                    toolName="create_bucket",
+                    state="input-available",
+                    input={"name": "test"},
+                )
+
+            async def mock_confirm_tool(chat_id, tool_call_id, tool_name):
+                yield TextEvent(type="text", text="Bucket created!")
+                yield FinishEvent(type="finish", finishReason="stop")
+
+            mock_client.send_message = mock_send_message
+            mock_client.confirm_tool = mock_confirm_tool
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_get_client.return_value = mock_client
+
+            result = runner.invoke(main, ["chat", "--auto-approve", "-m", "Create bucket"])
+
+            assert result.exit_code == 0
+            assert "Bucket created!" in result.output
+            mock_client.submit_approval.assert_not_called()
+
+
+class TestServiceOptionThroughClick:
+    """Tests that drive --service / KAI_SERVICE through the Click layer.
+
+    These fail if the @click.option decorator or the ctx.obj assignment is
+    removed, which the ctx.obj-based tests below cannot detect.
+    """
+
+    @staticmethod
+    def _patched_factory():
+        return patch("kai_client.cli.KaiClient.from_storage_api")
+
+    @staticmethod
+    def _mock_client():
+        mock_client = AsyncMock()
+        mock_client.ping = AsyncMock(return_value=PingResponse(timestamp="2025-01-01T00:00:00Z"))
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        return mock_client
+
+    def test_default_is_agent(self, runner, mock_env):
+        with self._patched_factory() as mock_factory:
+            mock_factory.return_value = self._mock_client()
+
+            result = runner.invoke(main, ["ping"])
+
+            assert result.exit_code == 0
+            assert mock_factory.call_args.kwargs["service"] is KaiBackend.AGENT
+
+    def test_service_flag_assistant(self, runner, mock_env):
+        with self._patched_factory() as mock_factory:
+            mock_factory.return_value = self._mock_client()
+
+            result = runner.invoke(main, ["--service", "assistant", "ping"])
+
+            assert result.exit_code == 0
+            assert mock_factory.call_args.kwargs["service"] is KaiBackend.ASSISTANT
+
+    def test_service_envvar_assistant(self, runner, mock_env):
+        with self._patched_factory() as mock_factory:
+            mock_factory.return_value = self._mock_client()
+
+            result = runner.invoke(main, ["ping"], env={"KAI_SERVICE": "assistant"})
+
+            assert result.exit_code == 0
+            assert mock_factory.call_args.kwargs["service"] is KaiBackend.ASSISTANT
+
+    def test_service_envvar_accepts_full_service_id(self, runner, mock_env):
+        with self._patched_factory() as mock_factory:
+            mock_factory.return_value = self._mock_client()
+
+            result = runner.invoke(main, ["ping"], env={"KAI_SERVICE": "kai-assistant"})
+
+            assert result.exit_code == 0
+            assert mock_factory.call_args.kwargs["service"] is KaiBackend.ASSISTANT
+
+    def test_service_flag_full_agent_id(self, runner, mock_env):
+        with self._patched_factory() as mock_factory:
+            mock_factory.return_value = self._mock_client()
+
+            result = runner.invoke(main, ["--service", "kai-agent", "ping"])
+
+            assert result.exit_code == 0
+            assert mock_factory.call_args.kwargs["service"] is KaiBackend.AGENT
+
+    def test_invalid_service_rejected(self, runner, mock_env):
+        result = runner.invoke(main, ["--service", "nope", "ping"])
+
+        assert result.exit_code != 0
+        assert "Invalid value" in result.output
 
 
 class TestHistoryCommand:

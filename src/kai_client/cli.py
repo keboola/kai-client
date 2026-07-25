@@ -15,7 +15,7 @@ _env_local = Path.cwd() / ".env.local"
 if _env_local.exists():
     load_dotenv(_env_local)
 
-from kai_client import KaiBackend, KaiClient, __version__  # noqa: E402
+from kai_client import KaiBackend, KaiClient, KaiError, __version__  # noqa: E402
 from kai_client.models import ToolApprovalRequestEvent  # noqa: E402
 from kai_client.types import VoteType  # noqa: E402
 
@@ -54,10 +54,14 @@ def run_async(coro):
 )
 @click.option(
     "--service",
-    type=click.Choice(["agent", "assistant"]),
+    type=click.Choice(["agent", "assistant", "kai-agent", "kai-assistant"]),
     default="agent",
     envvar="KAI_SERVICE",
-    help="Which Kai backend to auto-discover (default: agent). Ignored with --base-url.",
+    help=(
+        "Which Kai backend to auto-discover: agent (default) or assistant; "
+        "the full service ids kai-agent/kai-assistant are also accepted. "
+        "Ignored with --base-url."
+    ),
 )
 @click.pass_context
 def main(ctx, token: Optional[str], url: Optional[str], base_url: Optional[str], service: str):
@@ -106,7 +110,12 @@ async def get_client(ctx) -> KaiClient:
         )
 
     # Production mode - auto-discover URL
-    service_map = {"agent": KaiBackend.AGENT, "assistant": KaiBackend.ASSISTANT}
+    service_map = {
+        "agent": KaiBackend.AGENT,
+        "kai-agent": KaiBackend.AGENT,
+        "assistant": KaiBackend.ASSISTANT,
+        "kai-assistant": KaiBackend.ASSISTANT,
+    }
     service = service_map[ctx.obj.get("service") or "agent"]
     return await KaiClient.from_storage_api(
         storage_api_token=token,
@@ -265,6 +274,54 @@ async def display_tool_result_events(
                 break
 
 
+def _display_event(
+    event,
+    json_output: bool,
+    current_tool_name: dict[str, str],
+) -> None:
+    """Render a single SSE event (shared by both approval flows).
+
+    ``current_tool_name`` maps tool_call_id -> tool_name and is updated in place,
+    so that output-available events with a null tool_name still display a name.
+    """
+    if json_output:
+        click.echo(json.dumps(event.model_dump(), default=str))
+        return
+
+    if event.type == "text":
+        click.echo(event.text, nl=False)
+    elif event.type == "step-start":
+        click.echo("\n[Processing...]", nl=False)
+    elif event.type == "tool-call":
+        # Track tool names by tool_call_id
+        if event.tool_call_id and event.tool_name:
+            current_tool_name[event.tool_call_id] = event.tool_name
+        # Get the tool name, falling back to tracked name if null
+        tool_name = event.tool_name or current_tool_name.get(event.tool_call_id or "", "unknown")
+
+        if event.state == "started":
+            click.echo(f"\n[Calling {tool_name}...]", nl=False)
+        elif event.state == "input-available":
+            click.echo(f"\n[Tool {tool_name} requires approval]")
+        elif event.state == "output-available":
+            click.echo(f"\n[{tool_name} completed]", nl=False)
+    elif event.type == "tool-output-error":
+        click.echo(f"\n[Tool Error: {event.error_text}]", err=True)
+    elif event.type == "finish":
+        click.echo()  # Final newline
+    elif event.type == "error":
+        click.echo(f"\n[Error: {event.message}]", err=True)
+
+
+def _decide_approval(auto_approve: bool, json_output: bool) -> bool:
+    """Ask the user (or auto-approve) whether to run a pending tool call."""
+    if auto_approve:
+        if not json_output:
+            click.echo("[Auto-approving...]")
+        return True
+    return click.confirm("Approve this tool call?")
+
+
 async def send_and_display(
     client: KaiClient,
     chat_id: str,
@@ -272,7 +329,79 @@ async def send_and_display(
     auto_approve: bool,
     json_output: bool,
 ):
-    """Send a message and display the response."""
+    """Send a message and display the response, handling tool approvals.
+
+    The two backends use incompatible approval protocols, so the flow is chosen
+    from ``client.backend``:
+
+    - ``KaiBackend.ASSISTANT`` -> the legacy/v6 flow (``approve_tool`` /
+      ``confirm_tool``), which replies *after* the first stream ends.
+    - ``KaiBackend.AGENT`` -> ``submit_approval``, which must be called while the
+      original stream is still open.
+
+    ``client.backend`` is ``None`` when the client was built directly instead of
+    through discovery — for the CLI that is the ``--base-url`` local-dev path,
+    where the backend behind the URL is unknown. We assume the agent protocol
+    there: kai-agent is the library default, it is the modern protocol, and it is
+    what a locally-run backend is expected to speak.
+    """
+    if client.backend is KaiBackend.ASSISTANT:
+        await _send_and_display_v6(client, chat_id, message, auto_approve, json_output)
+    else:
+        await _send_and_display_agent(client, chat_id, message, auto_approve, json_output)
+
+
+async def _send_and_display_agent(
+    client: KaiClient,
+    chat_id: str,
+    message: str,
+    auto_approve: bool,
+    json_output: bool,
+):
+    """Stream a message, resolving approvals inline via ``submit_approval``.
+
+    On kai-agent a tool that needs approval is announced by a tool-call event in
+    the ``input-available`` state and the stream then blocks until the decision is
+    POSTed to the approval endpoint. The decision therefore has to be made from
+    inside the streaming loop; the same stream afterwards carries the
+    post-approval events (tool output, further text, finish).
+    """
+    current_tool_name: dict[str, str] = {}
+    decided: set[str] = set()
+
+    async for event in client.send_message(chat_id, message):
+        _display_event(event, json_output, current_tool_name)
+
+        if (
+            event.type != "tool-call"
+            or event.state != "input-available"
+            or not event.tool_call_id
+            or event.tool_call_id in decided
+        ):
+            continue
+
+        decided.add(event.tool_call_id)
+        approved = _decide_approval(auto_approve, json_output)
+        try:
+            await client.submit_approval(
+                chat_id=chat_id,
+                tool_use_id=event.tool_call_id,
+                approved=approved,
+            )
+        except KaiError as e:
+            # Not fatal: a tool the backend auto-executes (e.g. a read-only one)
+            # has no pending approval to answer. Report it and keep streaming.
+            click.echo(f"\n[Approval not submitted: {e.message}]", err=True)
+
+
+async def _send_and_display_v6(
+    client: KaiClient,
+    chat_id: str,
+    message: str,
+    auto_approve: bool,
+    json_output: bool,
+):
+    """Stream a message using the legacy/v6 approval flow (kai-assistant)."""
     pending_approval = None
     # Track v6 approval request (separate event with approvalId)
     pending_approval_id: str | None = None
@@ -280,44 +409,22 @@ async def send_and_display(
     current_tool_name: dict[str, str] = {}  # tool_call_id -> tool_name
 
     async for event in client.send_message(chat_id, message):
+        _display_event(event, json_output, current_tool_name)
         if json_output:
-            click.echo(json.dumps(event.model_dump(), default=str))
-        else:
-            if event.type == "text":
-                click.echo(event.text, nl=False)
-            elif event.type == "step-start":
-                click.echo("\n[Processing...]", nl=False)
-            elif event.type == "tool-call":
-                # Track tool names by tool_call_id
-                if event.tool_call_id and event.tool_name:
-                    current_tool_name[event.tool_call_id] = event.tool_name
-                # Get the tool name, falling back to tracked name if null
-                tool_name = event.tool_name or current_tool_name.get(
-                    event.tool_call_id or "", "unknown"
-                )
+            continue
 
-                if event.state == "started":
-                    click.echo(f"\n[Calling {tool_name}...]", nl=False)
-                elif event.state == "input-available":
-                    click.echo(f"\n[Tool {tool_name} requires approval]")
-                    pending_approval = event
-                elif event.state == "output-available":
-                    click.echo(f"\n[{tool_name} completed]", nl=False)
-                    # Tool completed, clear pending approval if this was the pending tool
-                    if pending_approval and pending_approval.tool_call_id == event.tool_call_id:
-                        pending_approval = None
-                        pending_approval_id = None
-            elif event.type == "tool-approval-request":
-                # v6 approval flow: capture the approval ID
-                if isinstance(event, ToolApprovalRequestEvent):
-                    pending_approval_id = event.approval_id
-            elif event.type == "tool-output-error":
-                click.echo(f"\n[Tool Error: {event.error_text}]", err=True)
-            elif event.type == "finish":
-                if not json_output:
-                    click.echo()  # Final newline
-            elif event.type == "error":
-                click.echo(f"\n[Error: {event.message}]", err=True)
+        if event.type == "tool-call":
+            if event.state == "input-available":
+                pending_approval = event
+            elif event.state == "output-available":
+                # Tool completed, clear pending approval if this was the pending tool
+                if pending_approval and pending_approval.tool_call_id == event.tool_call_id:
+                    pending_approval = None
+                    pending_approval_id = None
+        elif event.type == "tool-approval-request":
+            # v6 approval flow: capture the approval ID
+            if isinstance(event, ToolApprovalRequestEvent):
+                pending_approval_id = event.approval_id
 
     # Handle tool approval if needed (pending_approval is set when a tool needs approval
     # and cleared when that tool completes)
