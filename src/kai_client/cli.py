@@ -15,7 +15,7 @@ _env_local = Path.cwd() / ".env.local"
 if _env_local.exists():
     load_dotenv(_env_local)
 
-from kai_client import KaiBackend, KaiClient, KaiError, __version__  # noqa: E402
+from kai_client import KaiBackend, KaiClient, KaiNotFoundError, __version__  # noqa: E402
 from kai_client.models import ToolApprovalRequestEvent  # noqa: E402
 from kai_client.types import VoteType  # noqa: E402
 
@@ -319,7 +319,9 @@ def _decide_approval(auto_approve: bool, json_output: bool) -> bool:
         if not json_output:
             click.echo("[Auto-approving...]")
         return True
-    return click.confirm("Approve this tool call?")
+    # err=True: under --json-output stdout carries only parseable event JSON, so
+    # the prompt has to go to stderr. Harmless for normal output either way.
+    return click.confirm("Approve this tool call?", err=True)
 
 
 async def send_and_display(
@@ -393,9 +395,16 @@ async def _send_and_display_agent(
                 tool_use_id=event.tool_call_id,
                 approved=approved,
             )
-        except KaiError as e:
-            # Not fatal: a tool the backend auto-executes (e.g. a read-only one)
-            # has no pending approval to answer. Report it and keep streaming.
+        except KaiNotFoundError as e:
+            # Not fatal, and only this case: a tool the backend auto-executes
+            # (e.g. a read-only one) has no pending approval to answer, so the
+            # POST 404s. Report it and keep streaming.
+            #
+            # Anything else — auth failure, 500, connection loss, timeout — is
+            # deliberately NOT caught. Swallowing those would leave the tool
+            # pending server-side while we resume the loop, stalling until the
+            # backend's approval timeout or the client's stream_timeout, with a
+            # single stderr line as the only clue.
             click.echo(f"\n[Approval not submitted: {e.message}]", err=True)
 
 

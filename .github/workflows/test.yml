@@ -26,7 +26,7 @@ jobs:
         run: uv sync --dev
 
       - name: Run tests
-        run: uv run pytest -v
+        run: uv run pytest -v --cov --cov-report=term-missing
 
       - name: Run linting
         run: uv run ruff check .

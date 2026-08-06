@@ -6,7 +6,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
-from kai_client import KaiBackend, KaiError, __version__
+from kai_client import (
+    KaiAuthenticationError,
+    KaiBackend,
+    KaiConnectionError,
+    KaiError,
+    KaiNotFoundError,
+    KaiTimeoutError,
+    __version__,
+)
 from kai_client.cli import get_client, get_env_or_error, main, run_async
 from kai_client.models import (
     ApprovalResponse,
@@ -602,13 +610,19 @@ class TestChatApprovalFlowSelection:
             mock_client.approve_tool.assert_not_called()
             mock_client.confirm_tool.assert_not_called()
 
-    def test_agent_submit_approval_error_is_not_fatal(self, runner, mock_env):
-        """A rejected approval POST is reported but the stream keeps going."""
+    def test_agent_submit_approval_404_is_not_fatal(self, runner, mock_env):
+        """A 404 (no pending approval) is reported but the stream keeps going.
+
+        kai-agent emits input-available for tools it auto-executes too, so the
+        approval POST can legitimately answer nothing.
+        """
         order: list = []
         with patch("kai_client.cli.get_client") as mock_get_client:
             mock_client = self._agent_client(order)
             mock_client.submit_approval = AsyncMock(
-                side_effect=KaiError(message="No pending approval", code="not_found:api")
+                side_effect=KaiNotFoundError(
+                    message="No pending approval", code="not_found:api"
+                )
             )
             mock_get_client.return_value = mock_client
 
@@ -617,6 +631,64 @@ class TestChatApprovalFlowSelection:
             assert result.exit_code == 0
             assert "No pending approval" in result.output
             assert "Bucket created!" in result.output
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            KaiError(message="An unexpected error occurred", code="internal:api"),
+            KaiAuthenticationError(message="Missing credentials", code="unauthorized:auth"),
+            KaiConnectionError(message="Failed to connect", cause="conn refused"),
+            KaiTimeoutError(message="Request timed out"),
+        ],
+        ids=["internal_500", "unauthorized", "connection", "timeout"],
+    )
+    def test_agent_submit_approval_real_failure_is_fatal(self, runner, mock_env, error):
+        """Anything other than a 404 must NOT be swallowed.
+
+        Swallowing these would resume the stream with the tool still pending
+        server-side, stalling until the backend's approval timeout or the
+        client's stream_timeout with one stderr line as the only clue.
+        """
+        order: list = []
+        with patch("kai_client.cli.get_client") as mock_get_client:
+            mock_client = self._agent_client(order)
+            mock_client.submit_approval = AsyncMock(side_effect=error)
+            mock_get_client.return_value = mock_client
+
+            result = runner.invoke(main, ["chat", "--auto-approve", "-m", "Create bucket"])
+
+            assert result.exit_code != 0
+            # The stream must NOT have been resumed after a real failure.
+            assert order == []
+            assert "Bucket created!" not in result.output
+
+    def test_agent_prompt_goes_to_stderr_under_json_output(self, runner, mock_env):
+        """--json-output: stdout stays parseable JSON, the prompt goes to stderr."""
+        order: list = []
+        with patch("kai_client.cli.get_client") as mock_get_client:
+            mock_client = self._agent_client(order)
+            mock_get_client.return_value = mock_client
+
+            result = runner.invoke(
+                main, ["chat", "--json-output", "-m", "Create bucket"], input="y\n"
+            )
+
+            assert result.exit_code == 0
+            assert "Approve this tool call?" not in result.stdout
+            assert "Approve this tool call?" in result.stderr
+            # Every event line on stdout must be parseable JSON. Lines not
+            # starting with '{' are CliRunner echoing the typed stdin back to
+            # stdout to simulate a terminal — a harness artifact, not something
+            # the CLI writes (verified against a real piped subprocess).
+            lines = [ln for ln in result.stdout.splitlines() if ln.startswith("{")]
+            assert len(lines) == 4, f"expected 4 event lines, got {result.stdout!r}"
+            for line in lines:
+                json.loads(line)
+            mock_client.submit_approval.assert_awaited_once_with(
+                chat_id="test-chat-id",
+                tool_use_id="tool-123",
+                approved=True,
+            )
 
     def test_unknown_backend_uses_agent_flow(self, runner, mock_env):
         """backend=None (the --base-url local-dev path) uses submit_approval."""
