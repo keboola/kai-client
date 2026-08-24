@@ -55,6 +55,21 @@ class TestKaiClientInit:
         assert client.timeout == 60.0
         assert client.stream_timeout == 120.0
 
+    def test_workspace_id_defaults_to_none(self):
+        client = KaiClient(
+            storage_api_token="token",
+            storage_api_url="https://connection.keboola.com",
+        )
+        assert client.workspace_id is None
+
+    def test_workspace_id_stored(self):
+        client = KaiClient(
+            storage_api_token="token",
+            storage_api_url="https://connection.keboola.com",
+            workspace_id="12345",
+        )
+        assert client.workspace_id == "12345"
+
 
 class TestUUIDGeneration:
     """Tests for UUID generation methods."""
@@ -174,6 +189,26 @@ class TestGetChat:
         request = httpx_mock.get_request()
         assert request.headers["x-storageapi-token"] == "test-token"
         assert request.headers["x-storageapi-url"] == "https://connection.test.keboola.com"
+        assert "x-workspace-id" not in request.headers
+
+    @pytest.mark.asyncio
+    async def test_get_chat_includes_workspace_id_when_set(self, httpx_mock: HTTPXMock):
+        client = KaiClient(
+            storage_api_token="test-token",
+            storage_api_url="https://connection.test.keboola.com",
+            base_url="http://localhost:3000",
+            workspace_id="12345",
+        )
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/chat/chat-123",
+            json={"id": "chat-123", "messages": []},
+        )
+
+        async with client:
+            await client.get_chat("chat-123")
+
+        request = httpx_mock.get_request()
+        assert request.headers["x-workspace-id"] == "12345"
 
 
 class TestDeleteChat:

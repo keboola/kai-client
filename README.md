@@ -166,7 +166,13 @@ kai --token "your-token" --url "https://connection.keboola.com" ping
 
 # Use a custom base URL for local development
 kai --base-url http://localhost:3000 chat -m "Hello"
+
+# Pin Kai's queries to a specific workspace (e.g. a Data App's own WORKSPACE_ID)
+kai --workspace-id "12345" chat -m "What tables can I see?"
 ```
+
+`--workspace-id` also reads the `WORKSPACE_ID` env var, which Keboola already injects into
+Data App containers — so inside a Data App you typically don't need to pass it explicitly.
 
 ### Help
 
@@ -403,7 +409,8 @@ client = await KaiClient.from_storage_api(
     storage_api_token: str,      # Keboola Storage API token
     storage_api_url: str,        # Keboola connection URL (e.g., https://connection.keboola.com)
     timeout: float = 300.0,      # Request timeout in seconds
-    stream_timeout: float = 600.0  # Streaming timeout in seconds
+    stream_timeout: float = 600.0,  # Streaming timeout in seconds
+    workspace_id: str | None = None,  # Pin queries to this workspace (e.g. a Data App's WORKSPACE_ID)
 )
 ```
 
@@ -417,9 +424,16 @@ KaiClient(
     storage_api_url: str,        # Keboola connection URL
     base_url: str = "http://localhost:3000",  # Kai API base URL
     timeout: float = 300.0,      # Request timeout in seconds
-    stream_timeout: float = 600.0  # Streaming timeout in seconds
+    stream_timeout: float = 600.0,  # Streaming timeout in seconds
+    workspace_id: str | None = None,  # Pin queries to this workspace (e.g. a Data App's WORKSPACE_ID)
 )
 ```
+
+> **Data Apps:** when Kai is embedded inside a running Data App, pass that app's own
+> `WORKSPACE_ID` env var (Keboola injects it into every Data App container) as `workspace_id`
+> so Kai's queries run against the app's own — potentially more restricted — workspace instead
+> of the default per-branch one. This is forwarded as the `x-workspace-id` header on every
+> request.
 
 #### Methods
 

@@ -1,6 +1,7 @@
 """Tests for the CLI module."""
 
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -98,6 +99,70 @@ class TestMainGroup:
             )
             # Should not fail with missing env vars since we passed options
             assert "my-token" in str(mock_get_client.call_args) or result.exit_code == 0
+
+    def test_workspace_id_option_passed_to_context(self, runner):
+        with patch("kai_client.cli.get_client") as mock_get_client:
+            mock_client = AsyncMock()
+            mock_client.ping = AsyncMock(
+                return_value=PingResponse(timestamp="2025-01-01T00:00:00Z")
+            )
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_get_client.return_value = mock_client
+
+            runner.invoke(
+                main,
+                [
+                    "--token", "my-token",
+                    "--url", "https://my-url.com",
+                    "--workspace-id", "ws-1",
+                    "ping",
+                ],
+            )
+            ctx = mock_get_client.call_args[0][0]
+            assert ctx.obj["workspace_id"] == "ws-1"
+
+    def test_workspace_id_from_env(self, runner, mock_env, monkeypatch):
+        monkeypatch.setenv("WORKSPACE_ID", "ws-env")
+        with patch("kai_client.cli.get_client") as mock_get_client:
+            mock_client = AsyncMock()
+            mock_client.ping = AsyncMock(
+                return_value=PingResponse(timestamp="2025-01-01T00:00:00Z")
+            )
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_get_client.return_value = mock_client
+
+            runner.invoke(main, ["ping"])
+            ctx = mock_get_client.call_args[0][0]
+            assert ctx.obj["workspace_id"] == "ws-env"
+
+
+class TestGetClient:
+    """Tests for the get_client() helper."""
+
+    @pytest.mark.asyncio
+    async def test_get_client_forwards_workspace_id_local(self):
+        ctx = SimpleNamespace(
+            obj={
+                "token": "t",
+                "url": "https://u",
+                "base_url": "http://localhost:4000",
+                "workspace_id": "ws-1",
+            }
+        )
+        client = await get_client(ctx)
+        assert client.workspace_id == "ws-1"
+
+    @pytest.mark.asyncio
+    async def test_get_client_forwards_workspace_id_production(self):
+        ctx = SimpleNamespace(
+            obj={"token": "t", "url": "https://u", "base_url": None, "workspace_id": "ws-2"}
+        )
+        with patch("kai_client.cli.KaiClient.from_storage_api") as mock_factory:
+            mock_factory.return_value = AsyncMock()
+            await get_client(ctx)
+            assert mock_factory.call_args.kwargs["workspace_id"] == "ws-2"
 
 
 class TestPingCommand:
@@ -810,5 +875,6 @@ class TestGetClientFunction:
             mock_factory.assert_called_once_with(
                 storage_api_token="test-token",
                 storage_api_url="https://connection.keboola.com",
+                workspace_id=None,
             )
             assert client == mock_client

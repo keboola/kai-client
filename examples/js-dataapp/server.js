@@ -21,6 +21,9 @@ app.use(express.static("public"));
 
 const STORAGE_API_TOKEN = process.env.STORAGE_API_TOKEN || process.env.KBC_TOKEN || "";
 const STORAGE_API_URL = process.env.STORAGE_API_URL || process.env.KBC_URL || "";
+// Injected automatically into every Data App container by Keboola — pins Kai's queries to
+// this app's own workspace instead of the default per-branch one. Empty outside a Data App.
+const WORKSPACE_ID = process.env.WORKSPACE_ID || "";
 
 let _kaiBaseUrl = null;
 
@@ -64,6 +67,7 @@ async function proxySSE(payload, res) {
       "Content-Type": "application/json",
       "x-storageapi-token": STORAGE_API_TOKEN,
       "x-storageapi-url": STORAGE_API_URL,
+      ...(WORKSPACE_ID && { "x-workspace-id": WORKSPACE_ID }),
     },
     body: JSON.stringify(payload),
   });

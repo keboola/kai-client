@@ -39,11 +39,17 @@ Show a clear error if credentials are missing:
 ```python
 token = os.environ.get("STORAGE_API_TOKEN", "")
 api_url = os.environ.get("STORAGE_API_URL", "")
+workspace_id = os.environ.get("WORKSPACE_ID") or None
 
 if not token or not api_url:
     st.error("Missing credentials. Create a `.env.local` file...")
     st.stop()
 ```
+
+> **`WORKSPACE_ID`** is injected automatically into every Data App container by Keboola — never
+> set it in `.env.local`. Pass it to `KaiClient`/`from_storage_api()` as `workspace_id` (see
+> below) so Kai's queries run against the app's own workspace instead of the default per-branch
+> one. It's normally unset locally, which is fine — `KaiClient` simply omits the header.
 
 ## Critical Patterns
 
@@ -72,6 +78,7 @@ async def get_client() -> KaiClient:
     return await KaiClient.from_storage_api(
         storage_api_token=token,
         storage_api_url=api_url,
+        workspace_id=workspace_id,
     )
 ```
 
