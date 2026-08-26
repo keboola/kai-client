@@ -32,6 +32,9 @@ st.title("Kai Chat")
 
 token = os.environ.get("STORAGE_API_TOKEN", "")
 api_url = os.environ.get("STORAGE_API_URL", "")
+# Injected automatically into every Data App container by Keboola — pins Kai's queries to
+# this app's own workspace instead of the default per-branch one. Unset outside a Data App.
+workspace_id = os.environ.get("WORKSPACE_ID") or None
 
 if not token or not api_url:
     st.error(
@@ -107,6 +110,7 @@ async def get_client() -> KaiClient:
     return await KaiClient.from_storage_api(
         storage_api_token=token,
         storage_api_url=api_url,
+        workspace_id=workspace_id,
     )
 
 

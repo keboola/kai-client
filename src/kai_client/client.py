@@ -90,6 +90,7 @@ class KaiClient:
         storage_api_url: str,
         timeout: float = 300.0,
         stream_timeout: float = 600.0,
+        workspace_id: Optional[str] = None,
     ) -> "KaiClient":
         """
         Auto-discover the kai-assistant URL from the Keboola Storage API.
@@ -102,6 +103,9 @@ class KaiClient:
             storage_api_url: Keboola Storage API URL (e.g., https://connection.keboola.com).
             timeout: Default timeout for non-streaming requests in seconds.
             stream_timeout: Timeout for streaming requests in seconds.
+            workspace_id: Optional Keboola workspace ID to pin Kai's queries to — e.g. a
+                Data App's own `WORKSPACE_ID` env var, so Kai queries that workspace
+                instead of the default per-branch one.
 
         Returns:
             A configured KaiClient instance.
@@ -163,6 +167,7 @@ class KaiClient:
             base_url=kai_url,
             timeout=timeout,
             stream_timeout=stream_timeout,
+            workspace_id=workspace_id,
         )
 
     def __init__(
@@ -172,6 +177,7 @@ class KaiClient:
         base_url: str = "http://localhost:3000",
         timeout: float = 300.0,
         stream_timeout: float = 600.0,
+        workspace_id: Optional[str] = None,
     ) -> None:
         """
         Initialize the Kai client.
@@ -182,20 +188,27 @@ class KaiClient:
             base_url: Base URL for the Kai API (default: http://localhost:3000).
             timeout: Default timeout for non-streaming requests in seconds.
             stream_timeout: Timeout for streaming requests in seconds.
+            workspace_id: Optional Keboola workspace ID to pin Kai's queries to — e.g. a
+                Data App's own `WORKSPACE_ID` env var, so Kai queries that workspace
+                instead of the default per-branch one.
         """
         self.base_url = base_url.rstrip("/")
         self.storage_api_token = storage_api_token
         self.storage_api_url = storage_api_url
         self.timeout = timeout
         self.stream_timeout = stream_timeout
+        self.workspace_id = workspace_id
         self._client: Optional[httpx.AsyncClient] = None
 
     def _get_auth_headers(self) -> dict[str, str]:
         """Get authentication headers for API requests."""
-        return {
+        headers = {
             "x-storageapi-token": self.storage_api_token,
             "x-storageapi-url": self.storage_api_url,
         }
+        if self.workspace_id:
+            headers["x-workspace-id"] = self.workspace_id
+        return headers
 
     def _get_client(self) -> httpx.AsyncClient:
         """Get the HTTP client, creating it if necessary."""
