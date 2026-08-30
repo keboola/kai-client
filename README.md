@@ -95,8 +95,16 @@ STORAGE_API_URL=https://connection.keboola.com
 ```bash
 kai ping              # Check if the server is alive
 kai info              # Show server version, uptime, connected MCP servers
+kai verify            # Diagnose token, service URL, and monthly message quota
 kai --version         # Show CLI version
 ```
+
+`kai verify` is the right starting point when chats work in the Keboola
+platform UI but your app errors out. It reports which project/user the token
+resolves to, the discovered kai-assistant URL, and your current monthly
+message usage (e.g. `19/150 messages used, 131 left`). On a 429
+`rate_limit:chat` it prints the code and message cleanly instead of dumping
+raw JSON. Pass `--json-output` for a machine-readable report.
 
 #### Chat
 

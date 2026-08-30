@@ -177,8 +177,24 @@ async function readSSEStream(url, fetchOptions, onEvent) {
   const res = await fetch(url, fetchOptions);
 
   if (!res.ok) {
-    const err = await res.text();
-    addError(`Error: ${err}`);
+    // server.js returns {error: {status, code?, message}} for structured upstream
+    // errors. Fall back to raw text if the body isn't JSON.
+    let body;
+    try {
+      body = await res.json();
+    } catch {
+      body = null;
+    }
+    const e = body && body.error;
+    if (e && typeof e === "object") {
+      const prefix = e.code ? `${e.status || res.status} ${e.code}` : `${e.status || res.status}`;
+      // Prefer message, then code, then a generic fallback — handles {code} bodies
+      // with no message field.
+      const detail = e.message || e.code || "Request failed";
+      addError(`${prefix} — ${detail}`);
+    } else {
+      addError(`Error: ${typeof e === "string" ? e : res.statusText}`);
+    }
     return null;
   }
 

@@ -5,9 +5,10 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import click
+import httpx
 from dotenv import load_dotenv
 
 # Load .env.local file if it exists (before any commands run)
@@ -16,6 +17,7 @@ if _env_local.exists():
     load_dotenv(_env_local)
 
 from kai_client import KaiClient, __version__  # noqa: E402
+from kai_client.exceptions import KaiError  # noqa: E402
 from kai_client.models import ToolApprovalRequestEvent  # noqa: E402
 from kai_client.types import VoteType  # noqa: E402
 
@@ -76,6 +78,9 @@ def main(
 
         # Check server health
         kai ping
+
+        # Diagnose token / service / quota when things misbehave
+        kai verify
 
         # Start an interactive chat
         kai chat
@@ -160,6 +165,227 @@ def info(ctx):
     run_async(_info())
 
 
+class _VerifyRecorder:
+    """Collects per-check results for `kai verify` and prints them inline."""
+
+    def __init__(self, json_output: bool) -> None:
+        self.json_output = json_output
+        self.report: dict[str, Any] = {"ok": True, "checks": {}}
+
+    def record(self, name: str, ok: bool, summary: str, **extra: Any) -> None:
+        self.report["checks"][name] = {"ok": ok, "summary": summary, **extra}
+        if not ok:
+            self.report["ok"] = False
+        if not self.json_output:
+            mark = click.style("✓", fg="green") if ok else click.style("✗", fg="red")
+            click.echo(f"{mark} {name}: {summary}")
+
+
+def _format_kai_error(e: KaiError) -> str:
+    """Render a KaiError as `code: message`, falling back to message-only."""
+    if e.code and e.message:
+        return f"{e.code}: {e.message}"
+    return e.message or str(e)
+
+
+def _safe_json_body(resp: httpx.Response) -> dict[str, Any]:
+    """Parse `resp` as a JSON object, falling back to `{'error': <text>}`."""
+    if "application/json" in resp.headers.get("content-type", ""):
+        try:
+            parsed = resp.json()
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            return parsed
+    return {"error": resp.text}
+
+
+async def _check_token(url: str, token: str, recorder: _VerifyRecorder) -> Optional[dict[str, Any]]:
+    """Verify the token via Storage API; return the parsed token info on success."""
+    async with httpx.AsyncClient() as http_client:
+        try:
+            resp = await http_client.get(
+                f"{url.rstrip('/')}/v2/storage/tokens/verify",
+                headers={"x-storageapi-token": token},
+                timeout=30.0,
+            )
+        except httpx.RequestError as e:
+            recorder.record("token", False, f"connection error: {e}")
+            return None
+
+    if resp.status_code >= 400:
+        body = _safe_json_body(resp)
+        code = body.get("code") or f"http:{resp.status_code}"
+        msg = body.get("error") or body.get("message") or resp.reason_phrase
+        recorder.record("token", False, f"HTTP {resp.status_code} {code}: {msg}")
+        return None
+
+    # Symmetric with the >= 400 branch: tolerate a malformed-but-2xx body
+    # so the diagnostic surfaces "Storage API returned malformed JSON"
+    # instead of crashing with JSONDecodeError.
+    try:
+        parsed = resp.json()
+    except ValueError as e:
+        recorder.record("token", False, f"malformed JSON in 2xx response: {e}")
+        return None
+    if not isinstance(parsed, dict):
+        recorder.record("token", False, f"unexpected response shape: {type(parsed).__name__}")
+        return None
+
+    owner = parsed.get("owner") or {}
+    project_id = owner.get("id")
+    project_name = owner.get("name", "?")
+    description = parsed.get("description", "?")
+    is_master = parsed.get("isMasterToken", False)
+    token_type = "master" if is_master else "scoped"
+    summary = f"project {project_id} ({project_name}), token '{description}' [{token_type}]"
+    recorder.record(
+        "token",
+        True,
+        summary,
+        project_id=project_id,
+        project_name=project_name,
+        token_description=description,
+        is_master_token=is_master,
+    )
+    return parsed
+
+
+async def _check_service_discovery(
+    token: str, url: str, base_url: Optional[str], recorder: _VerifyRecorder
+) -> Optional[KaiClient]:
+    """Build a KaiClient (auto-discover or honour --base-url for local dev)."""
+    try:
+        if base_url:
+            client = KaiClient(storage_api_token=token, storage_api_url=url, base_url=base_url)
+            recorder.record("service-discovery", True, f"using --base-url {base_url}")
+        else:
+            client = await KaiClient.from_storage_api(storage_api_token=token, storage_api_url=url)
+            recorder.record(
+                "service-discovery",
+                True,
+                f"kai-assistant at {client.base_url}",
+            )
+    except KaiError as e:
+        recorder.record(
+            "service-discovery",
+            False,
+            _format_kai_error(e),
+            code=e.code,
+            message=e.message,
+        )
+        return None
+    return client
+
+
+async def _check_reachability(client: KaiClient, recorder: _VerifyRecorder) -> None:
+    """Ping + info (no auth).
+
+    Both checks run independently — `info` is not short-circuited when `ping`
+    fails. The two endpoints can fail in different ways (e.g. ping returns 200
+    but info returns 500 if a downstream MCP server is unhealthy), so showing
+    both results yields better diagnostic signal than collapsing to a single
+    line. The cost is one extra HTTP request on a totally-down service.
+    """
+    try:
+        ping_resp = await client.ping()
+        recorder.record("ping", True, f"server alive at {ping_resp.timestamp.isoformat()}")
+    except KaiError as e:
+        recorder.record("ping", False, _format_kai_error(e), code=e.code, message=e.message)
+
+    try:
+        info_resp = await client.info()
+        recorder.record(
+            "info",
+            True,
+            f"{info_resp.app_name} v{info_resp.app_version} "
+            f"(server v{info_resp.server_version}, uptime {info_resp.uptime:.0f}s)",
+            server_version=info_resp.server_version,
+        )
+    except KaiError as e:
+        recorder.record("info", False, _format_kai_error(e), code=e.code, message=e.message)
+
+
+async def _check_usage(client: KaiClient, recorder: _VerifyRecorder) -> None:
+    """Authenticated probe + monthly message quota.
+
+    The KaiError handler renders any upstream `{code, message}` cleanly. The
+    headline symptom this command was built for is 429 ``rate_limit:chat``,
+    but 401/403/timeout etc. all surface through the same path.
+    """
+    try:
+        usage = await client.get_usage()
+        remaining = usage.messages_limit - usage.messages_used
+        recorder.record(
+            "usage",
+            True,
+            f"{usage.messages_used}/{usage.messages_limit} messages used "
+            f"(resets {usage.reset_date.date().isoformat()}, {remaining} left)",
+            messages_used=usage.messages_used,
+            messages_limit=usage.messages_limit,
+            reset_date=usage.reset_date.isoformat(),
+        )
+    except KaiError as e:
+        recorder.record("usage", False, _format_kai_error(e), code=e.code, message=e.message)
+
+
+def _emit_verify_footer(recorder: _VerifyRecorder) -> None:
+    """Print the final summary line (JSON dump or human-readable footer)."""
+    if recorder.json_output:
+        click.echo(json.dumps(recorder.report, indent=2, default=str))
+    elif recorder.report["ok"]:
+        click.echo()
+        click.echo(click.style("All checks passed.", fg="green"))
+    else:
+        click.echo()
+        click.echo(click.style("Some checks failed — see above.", fg="red"), err=True)
+
+
+@main.command()
+@click.option("--json-output", is_flag=True, help="Output as JSON")
+@click.pass_context
+def verify(ctx, json_output: bool):
+    """
+    Diagnose Kai setup: token identity, service reachability, message quota.
+
+    Use this when "it works in the Keboola platform UI but my app errors out".
+    Verify confirms which project/user the token resolves to, that the
+    kai-assistant service is reachable, and your current monthly message usage.
+
+    Examples:
+
+        kai verify
+        kai verify --json-output
+    """
+
+    async def _verify():
+        token = ctx.obj.get("token") or get_env_or_error("STORAGE_API_TOKEN")
+        url = ctx.obj.get("url") or get_env_or_error("STORAGE_API_URL")
+        base_url = ctx.obj.get("base_url")
+
+        recorder = _VerifyRecorder(json_output)
+        if not json_output:
+            click.echo(f"Storage API URL: {url}")
+
+        if await _check_token(url, token, recorder) is None:
+            _emit_verify_footer(recorder)
+            sys.exit(1)
+
+        client = await _check_service_discovery(token, url, base_url, recorder)
+        if client is None:
+            _emit_verify_footer(recorder)
+            sys.exit(1)
+
+        async with client:
+            await _check_reachability(client, recorder)
+            await _check_usage(client, recorder)
+
+        _emit_verify_footer(recorder)
+        sys.exit(0 if recorder.report["ok"] else 1)
+
+    run_async(_verify())
+
+
 @main.command()
 @click.option("-m", "--message", help="Send a single message instead of interactive mode")
 @click.option(
@@ -216,9 +442,7 @@ def chat(
 
             if message:
                 # Single message mode
-                await send_and_display(
-                    client, chat_id, message, auto_approve, json_output
-                )
+                await send_and_display(client, chat_id, message, auto_approve, json_output)
             else:
                 # Interactive mode
                 if not json_output:
@@ -328,9 +552,8 @@ async def send_and_display(
     # and cleared when that tool completes)
     if pending_approval:
         # Get the tool name from tracking dict or pending_approval
-        approved_tool_name = (
-            pending_approval.tool_name
-            or current_tool_name.get(pending_approval.tool_call_id or "", "unknown")
+        approved_tool_name = pending_approval.tool_name or current_tool_name.get(
+            pending_approval.tool_call_id or "", "unknown"
         )
 
         # Determine which approval flow to use
