@@ -39,11 +39,17 @@ Show a clear error if credentials are missing:
 ```python
 token = os.environ.get("STORAGE_API_TOKEN", "")
 api_url = os.environ.get("STORAGE_API_URL", "")
+workspace_id = os.environ.get("WORKSPACE_ID") or None
 
 if not token or not api_url:
     st.error("Missing credentials. Create a `.env.local` file...")
     st.stop()
 ```
+
+> **`WORKSPACE_ID`** is injected automatically into every Data App container by Keboola — never
+> set it in `.env.local`. Pass it to `KaiClient`/`from_storage_api()` as `workspace_id` (see
+> below) so Kai's queries run against the app's own workspace instead of the default per-branch
+> one. It's normally unset locally, which is fine — `KaiClient` simply omits the header.
 
 ## Critical Patterns
 
@@ -65,15 +71,23 @@ def run_async(coro):
 
 ### 2. Client Creation — Always Use `from_storage_api()`
 
-The `KaiClient()` constructor defaults `base_url` to `http://localhost:3000`. For production, you **must** use the async factory method which auto-discovers the real kai-assistant URL:
+The `KaiClient()` constructor defaults `base_url` to `http://localhost:3000`. For production, you **must** use the async factory method, which auto-discovers the real backend URL for the stack (the **kai-agent** backend by default):
 
 ```python
 async def get_client() -> KaiClient:
     return await KaiClient.from_storage_api(
         storage_api_token=token,
         storage_api_url=api_url,
+        workspace_id=workspace_id,
     )
 ```
+
+> **Note:** the tool-approval pattern shown further down uses `approve_tool` /
+> `reject_tool`, which only work against the legacy kai-assistant backend. Add
+> `service=KaiBackend.ASSISTANT` to the call above when using it. On kai-agent
+> the decision goes to `submit_approval` while the original stream is still
+> open, which does not fit Streamlit's rerun model — see the README's "Tool
+> Approval for Write Operations" section.
 
 > **Gotcha:** Using `KaiClient(token, url)` directly causes `httpx.RemoteProtocolError: illegal request line` because it sends requests to localhost.
 

@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Kai Assistant</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h1>Kai Assistant</h1>
+      <button id="new-chat" title="New Chat">+ New Chat</button>
+    </header>
+
+    <div id="messages"></div>
+
+    <div id="approval-bar" class="hidden">
+      <span>A tool requires your approval before it can execute.</span>
+      <div class="approval-buttons">
+        <button id="approve-btn" class="btn-approve">Approve</button>
+        <button id="deny-btn" class="btn-deny">Deny</button>
+      </div>
+    </div>
+
+    <div id="suggestions"></div>
+
+    <form id="chat-form">
+      <input type="text" id="chat-input" placeholder="Ask Kai anything about your Keboola project..." autocomplete="off">
+      <button type="submit" id="send-btn">Send</button>
+    </form>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

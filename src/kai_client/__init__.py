@@ -35,6 +35,8 @@ from kai_client.exceptions import (
     KaiTimeoutError,
 )
 from kai_client.models import (
+    AgentSettings,
+    ApprovalResponse,
     Chat,
     ChatDetail,
     ChatRequest,
@@ -51,6 +53,8 @@ from kai_client.models import (
     RequestContext,
     SSEEvent,
     StepStartEvent,
+    Suggestion,
+    SuggestionsResponse,
     TextEvent,
     TextPart,
     ToolApproval,
@@ -58,17 +62,22 @@ from kai_client.models import (
     ToolApprovalResponsePart,
     ToolCallEvent,
     ToolCallPart,
+    ToolInfo,
     ToolOutputErrorEvent,
     ToolResultPart,
+    ToolsListResponse,
     UnknownEvent,
     UsageEvent,
     UsageInfo,
+    UsageResponse,
+    UserAgentSettings,
     Vote,
     VoteRequest,
 )
 from kai_client.sse import SSEStreamParser, parse_sse_event, parse_sse_stream
 from kai_client.types import (
     FinishReason,
+    KaiBackend,
     MessageRole,
     SSEEventType,
     ToolCallState,
@@ -76,7 +85,7 @@ from kai_client.types import (
     VoteType,
 )
 
-__version__ = "0.11.0"
+__version__ = "0.13.0"
 
 __all__ = [
     # Main client
@@ -111,6 +120,14 @@ __all__ = [
     "HistoryResponse",
     "Vote",
     "ErrorResponse",
+    "ApprovalResponse",
+    "UsageResponse",
+    "AgentSettings",
+    "UserAgentSettings",
+    "ToolInfo",
+    "ToolsListResponse",
+    "Suggestion",
+    "SuggestionsResponse",
     # SSE models
     "SSEEvent",
     "TextEvent",
@@ -129,6 +146,7 @@ __all__ = [
     "parse_sse_stream",
     "parse_sse_event",
     # Enums
+    "KaiBackend",
     "VisibilityType",
     "VoteType",
     "MessageRole",

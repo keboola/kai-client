@@ -4,7 +4,7 @@ import uuid
 from contextlib import asynccontextmanager
 from json import JSONDecodeError
 from types import TracebackType
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Optional, Union
 
 import httpx
 
@@ -15,6 +15,8 @@ from kai_client.exceptions import (
     raise_for_error_response,
 )
 from kai_client.models import (
+    AgentSettings,
+    ApprovalResponse,
     Chat,
     ChatDetail,
     ChatRequest,
@@ -25,13 +27,21 @@ from kai_client.models import (
     PingResponse,
     RequestContext,
     SSEEvent,
+    SuggestionsResponse,
     TextPart,
+    ToolInfo,
     ToolResultPart,
+    ToolsListResponse,
+    UsageResponse,
+    UserAgentSettings,
     Vote,
     VoteRequest,
 )
 from kai_client.sse import parse_sse_stream
-from kai_client.types import VisibilityType, VoteType
+from kai_client.types import KaiBackend, VisibilityType, VoteType
+
+# Sentinel for "caller did not pass this argument" — distinct from None (explicit clear).
+_UNSET: Any = object()
 
 
 def _normalize_visibility(visibility: str | VisibilityType) -> str:
@@ -63,7 +73,7 @@ class KaiClient:
                 if event.type == "text":
                     print(event.text, end="", flush=True)
 
-        # Production (auto-discovers kai-assistant URL)
+        # Production (auto-discovers kai-agent URL)
         client = await KaiClient.from_storage_api(
             storage_api_token="your-token",
             storage_api_url="https://connection.keboola.com"
@@ -78,26 +88,35 @@ class KaiClient:
         cls,
         storage_api_token: str,
         storage_api_url: str,
+        *,
+        service: KaiBackend | str = KaiBackend.AGENT,
         timeout: float = 300.0,
         stream_timeout: float = 600.0,
+        workspace_id: Optional[str] = None,
     ) -> "KaiClient":
         """
-        Auto-discover the kai-assistant URL from the Keboola Storage API.
+        Auto-discover the Kai backend URL (defaults to kai-agent) from the Keboola Storage API.
 
-        This factory method queries the Storage API to find the kai-assistant
+        This factory method queries the Storage API to find the requested
         service URL for your stack, then creates a client configured for production.
 
         Args:
             storage_api_token: Keboola Storage API token for authentication.
             storage_api_url: Keboola Storage API URL (e.g., https://connection.keboola.com).
+            service: Which backend to discover. Defaults to KaiBackend.AGENT
+                (the modern agent backend). Pass KaiBackend.ASSISTANT for the
+                legacy backend, or a raw service-id string.
             timeout: Default timeout for non-streaming requests in seconds.
             stream_timeout: Timeout for streaming requests in seconds.
+            workspace_id: Optional Keboola workspace ID to pin Kai's queries to — e.g. a
+                Data App's own `WORKSPACE_ID` env var, so Kai queries that workspace
+                instead of the default per-branch one.
 
         Returns:
             A configured KaiClient instance.
 
         Raises:
-            KaiError: If the kai-assistant service is not found or discovery fails.
+            KaiError: If the requested service is not found or discovery fails.
 
         Example:
             ```python
@@ -107,6 +126,8 @@ class KaiClient:
             )
             ```
         """
+        service_id = service.value if isinstance(service, KaiBackend) else service
+
         async with httpx.AsyncClient() as http_client:
             try:
                 response = await http_client.get(
@@ -118,7 +139,7 @@ class KaiClient:
                 data = response.json()
             except httpx.HTTPStatusError as e:
                 raise KaiError(
-                    message=f"Failed to discover kai-assistant URL: HTTP {e.response.status_code}",
+                    message=f"Failed to discover {service_id} URL: HTTP {e.response.status_code}",
                     code="discovery:http_error",
                 ) from e
             except httpx.RequestError as e:
@@ -129,23 +150,28 @@ class KaiClient:
 
         services = data.get("services", [])
         kai_service = next(
-            (s for s in services if s.get("id") == "kai-assistant"),
+            (s for s in services if s.get("id") == service_id),
             None,
         )
 
         if not kai_service:
             available = [s.get("id") for s in services]
             raise KaiError(
-                message=f"kai-assistant service not found. Available services: {available}",
+                message=f"{service_id} service not found. Available services: {available}",
                 code="discovery:service_not_found",
             )
 
         kai_url = kai_service.get("url")
         if not kai_url:
             raise KaiError(
-                message="kai-assistant service has no URL",
+                message=f"{service_id} service has no URL",
                 code="discovery:no_url",
             )
+
+        try:
+            backend: KaiBackend | None = KaiBackend(service_id)
+        except ValueError:
+            backend = None
 
         return cls(
             storage_api_token=storage_api_token,
@@ -153,6 +179,8 @@ class KaiClient:
             base_url=kai_url,
             timeout=timeout,
             stream_timeout=stream_timeout,
+            backend=backend,
+            workspace_id=workspace_id,
         )
 
     def __init__(
@@ -162,6 +190,8 @@ class KaiClient:
         base_url: str = "http://localhost:3000",
         timeout: float = 300.0,
         stream_timeout: float = 600.0,
+        backend: KaiBackend | None = None,
+        workspace_id: Optional[str] = None,
     ) -> None:
         """
         Initialize the Kai client.
@@ -172,20 +202,30 @@ class KaiClient:
             base_url: Base URL for the Kai API (default: http://localhost:3000).
             timeout: Default timeout for non-streaming requests in seconds.
             stream_timeout: Timeout for streaming requests in seconds.
+            backend: The resolved KaiBackend this client targets, or None when
+                constructed directly (backend behind base_url is unknown).
+            workspace_id: Optional Keboola workspace ID to pin Kai's queries to — e.g. a
+                Data App's own `WORKSPACE_ID` env var, so Kai queries that workspace
+                instead of the default per-branch one.
         """
         self.base_url = base_url.rstrip("/")
         self.storage_api_token = storage_api_token
         self.storage_api_url = storage_api_url
         self.timeout = timeout
         self.stream_timeout = stream_timeout
+        self.backend = backend
+        self.workspace_id = workspace_id
         self._client: Optional[httpx.AsyncClient] = None
 
     def _get_auth_headers(self) -> dict[str, str]:
         """Get authentication headers for API requests."""
-        return {
+        headers = {
             "x-storageapi-token": self.storage_api_token,
             "x-storageapi-url": self.storage_api_url,
         }
+        if self.workspace_id:
+            headers["x-workspace-id"] = self.workspace_id
+        return headers
 
     def _get_client(self) -> httpx.AsyncClient:
         """Get the HTTP client, creating it if necessary."""
@@ -302,12 +342,17 @@ class KaiClient:
         return str(uuid.uuid4())
 
     # =========================================================================
-    # Health & Info Endpoints (No Auth Required)
+    # Health & Info Endpoints
     # =========================================================================
+    # /ping is public on both backends. /api requires credentials on kai-agent
+    # (it returns 401 "Missing credentials" without them) and ignores them on
+    # kai-assistant, so info() always sends the auth headers.
 
     async def ping(self) -> PingResponse:
         """
         Check if the server is alive.
+
+        This endpoint is public on both backends, so no credentials are sent.
 
         Returns:
             PingResponse with the server timestamp.
@@ -319,10 +364,13 @@ class KaiClient:
         """
         Get server information including MCP connection status.
 
+        Sends the authentication headers: the kai-agent backend requires
+        credentials on ``/api``, and kai-assistant accepts them harmlessly.
+
         Returns:
             InfoResponse with server details.
         """
-        response = await self._request("GET", "/api", auth=False)
+        response = await self._request("GET", "/api")
         return InfoResponse.model_validate(response.json())
 
     # =========================================================================
@@ -461,6 +509,11 @@ class KaiClient:
         """
         Respond to a tool approval request (Vercel AI SDK v6 approval flow).
 
+        .. deprecated::
+            Use :meth:`submit_approval` instead. This method uses the old
+            Vercel AI SDK v6 protocol (fetch-chat → mutate-message → re-POST)
+            which is not supported by the kai-agent backend.
+
         This works by fetching the chat, finding the assistant message that
         contains the tool call requiring approval, updating its state to
         ``approval-responded``, and re-sending the updated assistant message
@@ -570,6 +623,10 @@ class KaiClient:
         """
         Approve a pending tool call and continue the stream.
 
+        .. deprecated::
+            Use :meth:`submit_approval` instead. This method uses the old
+            Vercel AI SDK v6 protocol not supported by the kai-agent backend.
+
         Args:
             chat_id: The chat session ID.
             approval_id: The approval ID from the tool-call event's approval.id field.
@@ -601,6 +658,11 @@ class KaiClient:
     ) -> AsyncIterator[SSEEvent]:
         """
         Reject a pending tool call and continue the stream.
+
+        .. deprecated::
+            Use :meth:`submit_approval` with ``approved=False`` instead. This
+            method uses the old Vercel AI SDK v6 protocol not supported by the
+            kai-agent backend.
 
         Args:
             chat_id: The chat session ID.
@@ -636,9 +698,10 @@ class KaiClient:
         Send a tool result (legacy method, prefer send_tool_approval_response).
 
         .. deprecated::
-            Use send_tool_approval_response / approve_tool / reject_tool instead.
-            This method uses the old tool-result protocol which can cause empty
-            user message errors with the Vercel AI SDK v6 backend.
+            Use :meth:`submit_approval` for the kai-agent backend.
+            Use send_tool_approval_response / approve_tool / reject_tool for the
+            old Vercel AI SDK v6 backend. This method uses the old tool-result
+            protocol which can cause empty user message errors.
 
         Args:
             chat_id: The chat session ID.
@@ -743,6 +806,10 @@ class KaiClient:
         """
         Resume a chat stream if one is available.
 
+        .. deprecated::
+            The kai-agent backend does not expose a stream-resume endpoint.
+            This method is only functional against older backends.
+
         This can be used to reconnect to an ongoing stream after a disconnect.
 
         Args:
@@ -768,6 +835,45 @@ class KaiClient:
             chat_id: The chat session ID to delete.
         """
         await self._request("DELETE", "/api/chat", params={"id": chat_id})
+
+    async def submit_approval(
+        self,
+        chat_id: str,
+        tool_use_id: str,
+        approved: bool,
+        *,
+        reason: Optional[str] = None,
+        updated_input: Optional[dict[str, Any]] = None,
+        answers: Optional[dict[str, Any]] = None,
+    ) -> ApprovalResponse:
+        """
+        Approve or deny a pending tool call (kai-agent backend).
+
+        This is a non-streaming call that unblocks the live SSE stream still
+        running from the original send_message call. The toolCallId from the
+        ``tool-input-available`` SSE event is the ``tool_use_id`` to pass here.
+
+        Args:
+            chat_id: The chat session ID.
+            tool_use_id: The toolCallId from the tool-input-available SSE event.
+            approved: Whether to approve (True) or deny (False) the tool call.
+            reason: Optional reason for the decision.
+            updated_input: Optional modified tool input (only used when approved).
+            answers: Optional answers for interactive tool questions.
+
+        Returns:
+            ApprovalResponse confirming the decision.
+        """
+        payload: dict[str, Any] = {"toolUseId": tool_use_id, "approved": approved}
+        if reason is not None:
+            payload["reason"] = reason
+        if updated_input is not None:
+            payload["updatedInput"] = updated_input
+        if answers is not None:
+            payload["answers"] = answers
+
+        response = await self._request("POST", f"/api/chat/{chat_id}/approval", json=payload)
+        return ApprovalResponse.model_validate(response.json())
 
     # =========================================================================
     # History Endpoint
@@ -918,6 +1024,151 @@ class KaiClient:
             The created/updated vote.
         """
         return await self.vote(chat_id, message_id, VoteType.DOWN)
+
+    # =========================================================================
+    # Usage Endpoint
+    # =========================================================================
+
+    async def get_usage(self) -> UsageResponse:
+        """
+        Get rate limit usage information for the current user and project.
+
+        Returns:
+            UsageResponse with messages used, limit, and reset date.
+        """
+        response = await self._request("GET", "/api/usage")
+        return UsageResponse.model_validate(response.json())
+
+    # =========================================================================
+    # Settings Endpoints
+    # =========================================================================
+
+    async def get_settings(self) -> AgentSettings:
+        """
+        Get project-level agent settings.
+
+        Returns:
+            AgentSettings with custom instructions for the project.
+        """
+        response = await self._request("GET", "/api/settings")
+        return AgentSettings.model_validate(response.json())
+
+    async def update_settings(
+        self,
+        *,
+        custom_instructions: Union[str, None] = _UNSET,
+    ) -> AgentSettings:
+        """
+        Update project-level agent settings.
+
+        Only fields explicitly passed are included in the request — omitting a
+        parameter leaves the corresponding server value unchanged. Pass
+        ``custom_instructions=None`` to explicitly clear instructions.
+
+        Args:
+            custom_instructions: Custom system prompt instructions for the project.
+                Pass ``None`` to clear. Omit to leave unchanged.
+
+        Returns:
+            Updated AgentSettings.
+        """
+        payload: dict[str, Any] = {}
+        if custom_instructions is not _UNSET:
+            payload["customInstructions"] = custom_instructions
+
+        response = await self._request("PATCH", "/api/settings", json=payload)
+        return AgentSettings.model_validate(response.json())
+
+    async def get_user_settings(self) -> UserAgentSettings:
+        """
+        Get user-level agent settings.
+
+        Returns:
+            UserAgentSettings with custom instructions and tool permissions.
+        """
+        response = await self._request("GET", "/api/settings/user")
+        return UserAgentSettings.model_validate(response.json())
+
+    async def update_user_settings(
+        self,
+        *,
+        custom_instructions: Union[str, None] = _UNSET,
+        tool_permissions: Union[dict[str, str], None] = _UNSET,
+    ) -> UserAgentSettings:
+        """
+        Update user-level agent settings.
+
+        Only fields explicitly passed are included in the request — omitting a
+        parameter leaves the corresponding server value unchanged.
+
+        - Pass ``custom_instructions=None`` to clear instructions.
+        - Pass ``tool_permissions=None`` to reset all permissions to defaults.
+        - Pass a dict to ``tool_permissions`` to merge with existing values.
+
+        Valid permission values: ``"always_allow"``, ``"always_ask"``, ``"blocked"``.
+
+        Args:
+            custom_instructions: Custom system prompt instructions for this user.
+                Pass ``None`` to clear. Omit to leave unchanged.
+            tool_permissions: Dict mapping tool name to permission value.
+                Pass ``None`` to reset to defaults. Omit to leave unchanged.
+
+        Raises:
+            ValueError: If no fields are provided (nothing to update).
+
+        Returns:
+            Updated UserAgentSettings.
+        """
+        payload: dict[str, Any] = {}
+        if custom_instructions is not _UNSET:
+            payload["customInstructions"] = custom_instructions
+        if tool_permissions is not _UNSET:
+            payload["toolPermissions"] = tool_permissions
+
+        if not payload:
+            raise ValueError(
+                "update_user_settings() requires at least one argument; "
+                "call with explicit values or None to clear individual fields."
+            )
+
+        response = await self._request("PATCH", "/api/settings/user", json=payload)
+        return UserAgentSettings.model_validate(response.json())
+
+    async def get_tools(self) -> ToolsListResponse:
+        """
+        List all available MCP tools with their metadata.
+
+        Returns:
+            ToolsListResponse with tool names, descriptions, and read-only flags.
+        """
+        response = await self._request("GET", "/api/settings/tools")
+        data = response.json()
+        tools = [ToolInfo.model_validate(t) for t in data.get("tools", [])]
+        return ToolsListResponse(tools=tools)
+
+    # =========================================================================
+    # Suggestions Endpoint
+    # =========================================================================
+
+    async def get_suggestions(
+        self,
+        context: str,
+        data: dict[str, Any],
+    ) -> SuggestionsResponse:
+        """
+        Generate contextual AI suggestions.
+
+        Args:
+            context: The context type — one of ``"dashboard"``,
+                ``"job-detail"``, or ``"configuration-detail"``.
+            data: Context-specific data payload.
+
+        Returns:
+            SuggestionsResponse with a list of suggestions and session ID.
+        """
+        payload: dict[str, Any] = {"context": context, "data": data}
+        response = await self._request("POST", "/api/suggestions", json=payload)
+        return SuggestionsResponse.model_validate(response.json())
 
     # =========================================================================
     # Convenience Methods

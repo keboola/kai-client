@@ -8,6 +8,7 @@ from pytest_httpx import HTTPXMock
 
 from kai_client import (
     KaiAuthenticationError,
+    KaiBackend,
     KaiBadRequestError,
     KaiClient,
     KaiError,
@@ -54,6 +55,30 @@ class TestKaiClientInit:
         )
         assert client.timeout == 60.0
         assert client.stream_timeout == 120.0
+
+    def test_direct_construction_has_unknown_backend(self):
+        """Direct construction leaves backend None — the backend behind an
+        arbitrary base_url is unknown (only discovery can record it)."""
+        client = KaiClient(
+            storage_api_token="token",
+            storage_api_url="https://connection.keboola.com",
+            base_url="http://localhost:3000",
+        )
+        assert client.backend is None
+    def test_workspace_id_defaults_to_none(self):
+        client = KaiClient(
+            storage_api_token="token",
+            storage_api_url="https://connection.keboola.com",
+        )
+        assert client.workspace_id is None
+
+    def test_workspace_id_stored(self):
+        client = KaiClient(
+            storage_api_token="token",
+            storage_api_url="https://connection.keboola.com",
+            workspace_id="12345",
+        )
+        assert client.workspace_id == "12345"
 
 
 class TestUUIDGeneration:
@@ -135,6 +160,28 @@ class TestInfo:
         assert response.app_version == "1.0.0"
         assert len(response.connected_mcp) == 1
 
+    @pytest.mark.asyncio
+    async def test_info_sends_auth_headers(self, client: KaiClient, httpx_mock: HTTPXMock):
+        """Info must send auth headers: /api requires credentials on kai-agent."""
+        httpx_mock.add_response(
+            url="http://localhost:3000/api",
+            json={
+                "timestamp": "2025-12-24T16:24:10.641Z",
+                "uptime": 12345.67,
+                "appName": "kai-backend",
+                "appVersion": "1.0.0",
+                "serverVersion": "2.0.0",
+                "connectedMcp": [],
+            },
+        )
+
+        async with client:
+            await client.info()
+
+        request = httpx_mock.get_request()
+        assert request.headers["x-storageapi-token"] == "test-token"
+        assert request.headers["x-storageapi-url"] == "https://connection.test.keboola.com"
+
 
 class TestGetChat:
     """Tests for get_chat endpoint."""
@@ -174,6 +221,26 @@ class TestGetChat:
         request = httpx_mock.get_request()
         assert request.headers["x-storageapi-token"] == "test-token"
         assert request.headers["x-storageapi-url"] == "https://connection.test.keboola.com"
+        assert "x-workspace-id" not in request.headers
+
+    @pytest.mark.asyncio
+    async def test_get_chat_includes_workspace_id_when_set(self, httpx_mock: HTTPXMock):
+        client = KaiClient(
+            storage_api_token="test-token",
+            storage_api_url="https://connection.test.keboola.com",
+            base_url="http://localhost:3000",
+            workspace_id="12345",
+        )
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/chat/chat-123",
+            json={"id": "chat-123", "messages": []},
+        )
+
+        async with client:
+            await client.get_chat("chat-123")
+
+        request = httpx_mock.get_request()
+        assert request.headers["x-workspace-id"] == "12345"
 
 
 class TestDeleteChat:
@@ -758,14 +825,14 @@ class TestFromStorageApi:
     """Tests for from_storage_api factory method."""
 
     @pytest.mark.asyncio
-    async def test_from_storage_api_success(self, httpx_mock: HTTPXMock):
-        """Test successful URL discovery from Storage API."""
+    async def test_defaults_to_agent(self, httpx_mock: HTTPXMock):
+        """Default discovery targets the kai-agent service."""
         httpx_mock.add_response(
             url="https://connection.keboola.com/v2/storage",
             json={
                 "services": [
-                    {"id": "kai-assistant", "url": "https://kai.keboola.com"},
-                    {"id": "other-service", "url": "https://other.keboola.com"},
+                    {"id": "kai-assistant", "url": "https://assistant.keboola.com"},
+                    {"id": "kai-agent", "url": "https://agent.keboola.com"},
                 ]
             },
         )
@@ -775,20 +842,75 @@ class TestFromStorageApi:
             storage_api_url="https://connection.keboola.com",
         )
 
-        assert client.base_url == "https://kai.keboola.com"
-        assert client.storage_api_token == "test-token"
+        assert client.base_url == "https://agent.keboola.com"
+        assert client.backend == KaiBackend.AGENT
         await client.close()
 
     @pytest.mark.asyncio
-    async def test_from_storage_api_service_not_found(self, httpx_mock: HTTPXMock):
-        """Test error when kai-assistant service is not in the list."""
+    async def test_explicit_assistant(self, httpx_mock: HTTPXMock):
+        """service=KaiBackend.ASSISTANT selects the legacy service."""
         httpx_mock.add_response(
             url="https://connection.keboola.com/v2/storage",
             json={
                 "services": [
-                    {"id": "other-service", "url": "https://other.keboola.com"},
+                    {"id": "kai-assistant", "url": "https://assistant.keboola.com"},
+                    {"id": "kai-agent", "url": "https://agent.keboola.com"},
                 ]
             },
+        )
+
+        client = await KaiClient.from_storage_api(
+            storage_api_token="test-token",
+            storage_api_url="https://connection.keboola.com",
+            service=KaiBackend.ASSISTANT,
+        )
+
+        assert client.base_url == "https://assistant.keboola.com"
+        assert client.backend == KaiBackend.ASSISTANT
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_raw_string_service(self, httpx_mock: HTTPXMock):
+        """A raw service-id string resolves and normalizes to the enum."""
+        httpx_mock.add_response(
+            url="https://connection.keboola.com/v2/storage",
+            json={"services": [{"id": "kai-agent", "url": "https://agent.keboola.com"}]},
+        )
+
+        client = await KaiClient.from_storage_api(
+            storage_api_token="test-token",
+            storage_api_url="https://connection.keboola.com",
+            service="kai-agent",
+        )
+
+        assert client.base_url == "https://agent.keboola.com"
+        assert client.backend == KaiBackend.AGENT
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_unknown_service_id_leaves_backend_none(self, httpx_mock: HTTPXMock):
+        """A service id with no matching KaiBackend member records backend=None."""
+        httpx_mock.add_response(
+            url="https://connection.keboola.com/v2/storage",
+            json={"services": [{"id": "kai-future", "url": "https://future.keboola.com"}]},
+        )
+
+        client = await KaiClient.from_storage_api(
+            storage_api_token="test-token",
+            storage_api_url="https://connection.keboola.com",
+            service="kai-future",
+        )
+
+        assert client.base_url == "https://future.keboola.com"
+        assert client.backend is None
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_service_not_found(self, httpx_mock: HTTPXMock):
+        """Error names the requested service and lists available ids."""
+        httpx_mock.add_response(
+            url="https://connection.keboola.com/v2/storage",
+            json={"services": [{"id": "kai-assistant", "url": "https://assistant.keboola.com"}]},
         )
 
         with pytest.raises(KaiError) as exc_info:
@@ -797,19 +919,16 @@ class TestFromStorageApi:
                 storage_api_url="https://connection.keboola.com",
             )
 
-        assert "kai-assistant service not found" in str(exc_info.value)
+        assert "kai-agent service not found" in str(exc_info.value)
+        assert "kai-assistant" in str(exc_info.value)
         assert exc_info.value.code == "discovery:service_not_found"
 
     @pytest.mark.asyncio
-    async def test_from_storage_api_no_url(self, httpx_mock: HTTPXMock):
-        """Test error when kai-assistant service has no URL."""
+    async def test_no_url(self, httpx_mock: HTTPXMock):
+        """Error when the discovered service has no URL."""
         httpx_mock.add_response(
             url="https://connection.keboola.com/v2/storage",
-            json={
-                "services": [
-                    {"id": "kai-assistant"},  # No URL
-                ]
-            },
+            json={"services": [{"id": "kai-agent"}]},  # no URL
         )
 
         with pytest.raises(KaiError) as exc_info:
@@ -822,8 +941,8 @@ class TestFromStorageApi:
         assert exc_info.value.code == "discovery:no_url"
 
     @pytest.mark.asyncio
-    async def test_from_storage_api_http_error(self, httpx_mock: HTTPXMock):
-        """Test error when Storage API returns HTTP error."""
+    async def test_http_error(self, httpx_mock: HTTPXMock):
+        """Error when Storage API returns HTTP error; message names the requested service."""
         httpx_mock.add_response(
             url="https://connection.keboola.com/v2/storage",
             status_code=401,
@@ -836,19 +955,36 @@ class TestFromStorageApi:
                 storage_api_url="https://connection.keboola.com",
             )
 
+        assert "kai-agent" in str(exc_info.value)
         assert "HTTP 401" in str(exc_info.value)
         assert exc_info.value.code == "discovery:http_error"
 
     @pytest.mark.asyncio
-    async def test_from_storage_api_custom_timeouts(self, httpx_mock: HTTPXMock):
-        """Test that custom timeouts are passed to the client."""
+    async def test_http_error_names_explicit_service(self, httpx_mock: HTTPXMock):
+        """HTTP error message names kai-assistant when explicitly requested."""
         httpx_mock.add_response(
             url="https://connection.keboola.com/v2/storage",
-            json={
-                "services": [
-                    {"id": "kai-assistant", "url": "https://kai.keboola.com"},
-                ]
-            },
+            status_code=401,
+            json={"message": "Unauthorized"},
+        )
+
+        with pytest.raises(KaiError) as exc_info:
+            await KaiClient.from_storage_api(
+                storage_api_token="bad-token",
+                storage_api_url="https://connection.keboola.com",
+                service=KaiBackend.ASSISTANT,
+            )
+
+        assert "kai-assistant" in str(exc_info.value)
+        assert "HTTP 401" in str(exc_info.value)
+        assert exc_info.value.code == "discovery:http_error"
+
+    @pytest.mark.asyncio
+    async def test_custom_timeouts(self, httpx_mock: HTTPXMock):
+        """Custom timeouts are passed to the client."""
+        httpx_mock.add_response(
+            url="https://connection.keboola.com/v2/storage",
+            json={"services": [{"id": "kai-agent", "url": "https://agent.keboola.com"}]},
         )
 
         client = await KaiClient.from_storage_api(
@@ -2031,5 +2167,521 @@ class TestParseVoteIsUpvotedFormat:
         assert len(votes) == 2
         assert votes[0].type == "up"
         assert votes[1].type == "down"
+# =============================================================================
+# Tests for new kai-agent backend endpoints
+# =============================================================================
+
+CHAT_ID = "550e8400-e29b-41d4-a716-446655440000"
+TOOL_USE_ID = "tool-use-abc123"
+
+
+class TestSubmitApproval:
+    """Tests for submit_approval — POST /api/chat/{id}/approval."""
+
+    @pytest.mark.asyncio
+    async def test_submit_approval_approved(self, client: KaiClient, httpx_mock: HTTPXMock):
+        httpx_mock.add_response(
+            url=f"http://localhost:3000/api/chat/{CHAT_ID}/approval",
+            method="POST",
+            json={"success": True, "toolUseId": TOOL_USE_ID, "approved": True},
+        )
+
+        async with client:
+            result = await client.submit_approval(CHAT_ID, TOOL_USE_ID, approved=True)
+
+        assert result.success is True
+        assert result.tool_use_id == TOOL_USE_ID
+        assert result.approved is True
+
+    @pytest.mark.asyncio
+    async def test_submit_approval_denied(self, client: KaiClient, httpx_mock: HTTPXMock):
+        httpx_mock.add_response(
+            url=f"http://localhost:3000/api/chat/{CHAT_ID}/approval",
+            method="POST",
+            json={"success": True, "toolUseId": TOOL_USE_ID, "approved": False},
+        )
+
+        async with client:
+            result = await client.submit_approval(
+                CHAT_ID, TOOL_USE_ID, approved=False, reason="Too risky"
+            )
+
+        assert result.approved is False
+
+        request = httpx_mock.get_request()
+        body = json.loads(request.content)
+        assert body["approved"] is False
+        assert body["reason"] == "Too risky"
+
+    @pytest.mark.asyncio
+    async def test_submit_approval_with_optional_fields(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        httpx_mock.add_response(
+            url=f"http://localhost:3000/api/chat/{CHAT_ID}/approval",
+            method="POST",
+            json={"success": True, "toolUseId": TOOL_USE_ID, "approved": True},
+        )
+
+        async with client:
+            await client.submit_approval(
+                CHAT_ID,
+                TOOL_USE_ID,
+                approved=True,
+                updated_input={"name": "updated-bucket"},
+                answers={"confirm": "yes"},
+            )
+
+        request = httpx_mock.get_request()
+        body = json.loads(request.content)
+        assert body["updatedInput"] == {"name": "updated-bucket"}
+        assert body["answers"] == {"confirm": "yes"}
+
+    @pytest.mark.asyncio
+    async def test_submit_approval_omits_none_fields(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        httpx_mock.add_response(
+            url=f"http://localhost:3000/api/chat/{CHAT_ID}/approval",
+            method="POST",
+            json={"success": True, "toolUseId": TOOL_USE_ID, "approved": True},
+        )
+
+        async with client:
+            await client.submit_approval(CHAT_ID, TOOL_USE_ID, approved=True)
+
+        request = httpx_mock.get_request()
+        body = json.loads(request.content)
+        assert "reason" not in body
+        assert "updatedInput" not in body
+        assert "answers" not in body
+
+    @pytest.mark.asyncio
+    async def test_submit_approval_includes_auth_headers(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        httpx_mock.add_response(
+            url=f"http://localhost:3000/api/chat/{CHAT_ID}/approval",
+            method="POST",
+            json={"success": True, "toolUseId": TOOL_USE_ID, "approved": True},
+        )
+
+        async with client:
+            await client.submit_approval(CHAT_ID, TOOL_USE_ID, approved=True)
+
+        request = httpx_mock.get_request()
+        assert request.headers["x-storageapi-token"] == "test-token"
+        assert "connection.test.keboola.com" in request.headers["x-storageapi-url"]
+
+    @pytest.mark.asyncio
+    async def test_submit_approval_not_found(self, client: KaiClient, httpx_mock: HTTPXMock):
+        httpx_mock.add_response(
+            url=f"http://localhost:3000/api/chat/{CHAT_ID}/approval",
+            method="POST",
+            status_code=404,
+            json={
+                "code": "not_found:chat",
+                "message": "No pending approval found for this tool call.",
+            },
+        )
+
+        async with client:
+            with pytest.raises(KaiNotFoundError):
+                await client.submit_approval(CHAT_ID, TOOL_USE_ID, approved=True)
+
+
+class TestGetUsage:
+    """Tests for get_usage — GET /api/usage."""
+
+    @pytest.mark.asyncio
+    async def test_get_usage_success(self, client: KaiClient, httpx_mock: HTTPXMock):
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/usage",
+            json={
+                "messagesUsed": 42,
+                "messagesLimit": 500,
+                "resetDate": "2026-06-01T00:00:00.000Z",
+            },
+        )
+
+        async with client:
+            usage = await client.get_usage()
+
+        assert usage.messages_used == 42
+        assert usage.messages_limit == 500
+        assert usage.reset_date.year == 2026
+        assert usage.reset_date.month == 6
+
+    @pytest.mark.asyncio
+    async def test_get_usage_includes_auth(self, client: KaiClient, httpx_mock: HTTPXMock):
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/usage",
+            json={
+                "messagesUsed": 0,
+                "messagesLimit": 500,
+                "resetDate": "2026-06-01T00:00:00.000Z",
+            },
+        )
+
+        async with client:
+            await client.get_usage()
+
+        request = httpx_mock.get_request()
+        assert "x-storageapi-token" in request.headers
+
+
+class TestSettings:
+    """Tests for project-level settings — GET/PATCH /api/settings."""
+
+    _settings_payload = {
+        "projectId": "proj-123",
+        "customInstructions": "Always be concise.",
+        "createdAt": "2026-01-01T00:00:00.000Z",
+        "updatedAt": "2026-05-01T00:00:00.000Z",
+    }
+
+    @pytest.mark.asyncio
+    async def test_get_settings_success(self, client: KaiClient, httpx_mock: HTTPXMock):
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/settings",
+            json=self._settings_payload,
+        )
+
+        async with client:
+            settings = await client.get_settings()
+
+        assert settings.project_id == "proj-123"
+        assert settings.custom_instructions == "Always be concise."
+
+    @pytest.mark.asyncio
+    async def test_get_settings_null_instructions(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/settings",
+            json={**self._settings_payload, "customInstructions": None},
+        )
+
+        async with client:
+            settings = await client.get_settings()
+
+        assert settings.custom_instructions is None
+
+    @pytest.mark.asyncio
+    async def test_update_settings_with_instructions(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/settings",
+            method="PATCH",
+            json={**self._settings_payload, "customInstructions": "Be brief."},
+        )
+
+        async with client:
+            settings = await client.update_settings(custom_instructions="Be brief.")
+
+        assert settings.custom_instructions == "Be brief."
+
+        request = httpx_mock.get_request()
+        body = json.loads(request.content)
+        assert body["customInstructions"] == "Be brief."
+
+    @pytest.mark.asyncio
+    async def test_update_settings_clear_instructions(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        """Passing custom_instructions=None explicitly clears the field."""
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/settings",
+            method="PATCH",
+            json={**self._settings_payload, "customInstructions": None},
+        )
+
+        async with client:
+            settings = await client.update_settings(custom_instructions=None)
+
+        assert settings.custom_instructions is None
+
+        request = httpx_mock.get_request()
+        body = json.loads(request.content)
+        assert body["customInstructions"] is None
+
+    @pytest.mark.asyncio
+    async def test_update_settings_no_args_sends_empty_payload(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        """Omitting all args is a no-op — sends empty payload, leaves server state unchanged."""
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/settings",
+            method="PATCH",
+            json=self._settings_payload,
+        )
+
+        async with client:
+            await client.update_settings()
+
+        request = httpx_mock.get_request()
+        body = json.loads(request.content)
+        assert "customInstructions" not in body
+
+
+class TestUserSettings:
+    """Tests for user-level settings — GET/PATCH /api/settings/user."""
+
+    _user_settings_payload = {
+        "projectId": "proj-123",
+        "userId": "user-456",
+        "customInstructions": None,
+        "toolPermissions": {"create_config": "always_ask"},
+        "createdAt": "2026-01-01T00:00:00.000Z",
+        "updatedAt": "2026-05-01T00:00:00.000Z",
+    }
+
+    @pytest.mark.asyncio
+    async def test_get_user_settings_success(self, client: KaiClient, httpx_mock: HTTPXMock):
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/settings/user",
+            json=self._user_settings_payload,
+        )
+
+        async with client:
+            settings = await client.get_user_settings()
+
+        assert settings.user_id == "user-456"
+        assert settings.tool_permissions == {"create_config": "always_ask"}
+
+    @pytest.mark.asyncio
+    async def test_update_user_settings_tool_permissions(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        updated = {
+            **self._user_settings_payload,
+            "toolPermissions": {"create_config": "always_allow", "run_job": "blocked"},
+        }
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/settings/user",
+            method="PATCH",
+            json=updated,
+        )
+
+        async with client:
+            settings = await client.update_user_settings(
+                tool_permissions={"create_config": "always_allow", "run_job": "blocked"}
+            )
+
+        assert settings.tool_permissions["run_job"] == "blocked"
+
+        request = httpx_mock.get_request()
+        body = json.loads(request.content)
+        assert body["toolPermissions"]["create_config"] == "always_allow"
+
+    @pytest.mark.asyncio
+    async def test_update_user_settings_custom_instructions_only(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/settings/user",
+            method="PATCH",
+            json={**self._user_settings_payload, "customInstructions": "Speak formally."},
+        )
+
+        async with client:
+            await client.update_user_settings(custom_instructions="Speak formally.")
+
+        request = httpx_mock.get_request()
+        body = json.loads(request.content)
+        assert body["customInstructions"] == "Speak formally."
+        assert "toolPermissions" not in body
+
+    @pytest.mark.asyncio
+    async def test_update_user_settings_null_permissions_reset(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        """Passing tool_permissions=None explicitly resets permissions."""
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/settings/user",
+            method="PATCH",
+            json={**self._user_settings_payload, "toolPermissions": None},
+        )
+
+        async with client:
+            settings = await client.update_user_settings(tool_permissions=None)
+
+        assert settings.tool_permissions is None
+
+        request = httpx_mock.get_request()
+        body = json.loads(request.content)
+        assert body.get("toolPermissions") is None
+
+    @pytest.mark.asyncio
+    async def test_update_user_settings_clear_custom_instructions(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        """Passing custom_instructions=None explicitly clears the field."""
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/settings/user",
+            method="PATCH",
+            json={**self._user_settings_payload, "customInstructions": None},
+        )
+
+        async with client:
+            await client.update_user_settings(custom_instructions=None)
+
+        request = httpx_mock.get_request()
+        body = json.loads(request.content)
+        assert body["customInstructions"] is None
+        assert "toolPermissions" not in body
+
+    @pytest.mark.asyncio
+    async def test_update_user_settings_no_args_raises(self, client: KaiClient):
+        """Calling with no arguments raises ValueError."""
+        with pytest.raises(ValueError, match="at least one argument"):
+            await client.update_user_settings()
+
+
+class TestGetTools:
+    """Tests for get_tools — GET /api/settings/tools."""
+
+    @pytest.mark.asyncio
+    async def test_get_tools_success(self, client: KaiClient, httpx_mock: HTTPXMock):
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/settings/tools",
+            json={
+                "tools": [
+                    {"name": "get_tables", "description": "List tables", "readOnly": True},
+                    {"name": "create_config", "description": "Create config", "readOnly": False},
+                ]
+            },
+        )
+
+        async with client:
+            result = await client.get_tools()
+
+        assert len(result.tools) == 2
+        assert result.tools[0].name == "get_tables"
+        assert result.tools[0].read_only is True
+        assert result.tools[1].name == "create_config"
+        assert result.tools[1].read_only is False
+
+    @pytest.mark.asyncio
+    async def test_get_tools_empty_list(self, client: KaiClient, httpx_mock: HTTPXMock):
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/settings/tools",
+            json={"tools": []},
+        )
+
+        async with client:
+            result = await client.get_tools()
+
+        assert result.tools == []
+
+    @pytest.mark.asyncio
+    async def test_get_tools_includes_auth(self, client: KaiClient, httpx_mock: HTTPXMock):
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/settings/tools",
+            json={"tools": []},
+        )
+
+        async with client:
+            await client.get_tools()
+
+        request = httpx_mock.get_request()
+        assert "x-storageapi-token" in request.headers
+
+
+class TestGetSuggestions:
+    """Tests for get_suggestions — POST /api/suggestions."""
+
+    _suggestion = {
+        "id": "550e8400-e29b-41d4-a716-446655440001",
+        "label": "Fix failing job",
+        "prompt": "Help me fix the failing extraction job",
+        "priority": 1,
+        "category": "error",
+        "reasoning": "Job has been failing repeatedly",
+    }
+
+    @pytest.mark.asyncio
+    async def test_get_suggestions_success(self, client: KaiClient, httpx_mock: HTTPXMock):
+        session_id = "550e8400-e29b-41d4-a716-446655440002"
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/suggestions",
+            method="POST",
+            json={"suggestions": [self._suggestion], "suggestionSessionId": session_id},
+        )
+
+        async with client:
+            result = await client.get_suggestions(
+                context="job-detail", data={"jobId": "job-123", "status": "error"}
+            )
+
+        assert len(result.suggestions) == 1
+        assert result.suggestions[0].label == "Fix failing job"
+        assert result.suggestions[0].category == "error"
+        assert result.suggestion_session_id == session_id
+
+    @pytest.mark.asyncio
+    async def test_get_suggestions_sends_correct_payload(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/suggestions",
+            method="POST",
+            json={
+                "suggestions": [],
+                "suggestionSessionId": "550e8400-e29b-41d4-a716-446655440003",
+            },
+        )
+
+        async with client:
+            await client.get_suggestions(
+                context="dashboard", data={"projectId": "proj-123"}
+            )
+
+        request = httpx_mock.get_request()
+        body = json.loads(request.content)
+        assert body["context"] == "dashboard"
+        assert body["data"] == {"projectId": "proj-123"}
+
+    @pytest.mark.asyncio
+    async def test_get_suggestions_empty_result(self, client: KaiClient, httpx_mock: HTTPXMock):
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/suggestions",
+            method="POST",
+            json={
+                "suggestions": [],
+                "suggestionSessionId": "550e8400-e29b-41d4-a716-446655440004",
+            },
+        )
+
+        async with client:
+            result = await client.get_suggestions(context="dashboard", data={})
+
+        assert result.suggestions == []
+
+    @pytest.mark.asyncio
+    async def test_get_suggestions_context_variants(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        contexts = ("dashboard", "job-detail", "configuration-detail")
+        for _ in contexts:
+            httpx_mock.add_response(
+                url="http://localhost:3000/api/suggestions",
+                method="POST",
+                json={
+                    "suggestions": [],
+                    "suggestionSessionId": "550e8400-e29b-41d4-a716-446655440005",
+                },
+            )
+
+        async with client:
+            for context in contexts:
+                await client.get_suggestions(context=context, data={})
+
+        requests = httpx_mock.get_requests()
+        assert len(requests) == len(contexts)
+        for req, context in zip(requests, contexts):
+            body = json.loads(req.content)
+            assert body["context"] == context
 
 

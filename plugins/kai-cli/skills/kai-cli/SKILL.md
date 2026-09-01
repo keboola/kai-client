@@ -29,6 +29,39 @@ Or pass credentials via CLI flags:
 kai --token YOUR_TOKEN --url https://connection.keboola.com COMMAND
 ```
 
+### Backend Selection
+
+Keboola exposes two AI backends. The CLI auto-discovers **kai-agent** (the
+modern backend) by default; `--service assistant` selects the legacy
+kai-assistant backend, which only exists on single-tenant deployments:
+
+```bash
+kai chat -m "Hello"                     # kai-agent (default)
+kai --service assistant chat -m "Hello" # legacy backend
+```
+
+The flag can also be set with `KAI_SERVICE=agent|assistant` and is ignored when
+`--base-url` is used for local development.
+
+### Workspace Pinning
+
+By default Kai queries the project's per-branch workspace. `--workspace-id` pins
+its queries to a specific Keboola workspace instead, forwarded as the
+`x-workspace-id` header on every request:
+
+```bash
+kai --workspace-id "12345" chat -m "What tables can I see?"
+```
+
+The flag also reads the `WORKSPACE_ID` environment variable, which Keboola
+already injects into every Data App container — so a Kai call made from inside a
+Data App picks up that app's own (potentially more restricted) workspace with no
+extra configuration. Outside a Data App the variable is normally unset, and the
+header is simply omitted.
+
+`--workspace-id` is independent of `--service`: it applies to both backends, and
+unlike `--service` it is **not** ignored when `--base-url` is given.
+
 ### Installation
 
 Install from PyPI or run from source:
@@ -157,6 +190,19 @@ kai get-votes CHAT_ID             # View all votes for a chat
 | `kai delete-chat` | Delete a chat | `-y/--yes` |
 | `kai vote` | Vote on message | `up` or `down` |
 | `kai get-votes` | Get votes for chat | `--json-output` |
+
+### Global Options
+
+These go before the command (`kai --service assistant chat ...`) and apply to all
+of them:
+
+| Option | Env var | Default | Purpose |
+|--------|---------|---------|---------|
+| `--token` | `STORAGE_API_TOKEN` | — | Keboola Storage API token |
+| `--url` | `STORAGE_API_URL` | — | Keboola Storage API URL |
+| `--base-url` | `KAI_BASE_URL` | auto-discover | Kai API base URL for local development |
+| `--service` | `KAI_SERVICE` | `agent` | Which backend to discover; ignored with `--base-url` |
+| `--workspace-id` | `WORKSPACE_ID` | unset | Pin Kai's queries to one workspace |
 
 ## Common Usage Patterns
 

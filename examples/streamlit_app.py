@@ -20,7 +20,7 @@ from pathlib import Path
 import streamlit as st
 from dotenv import load_dotenv
 
-from kai_client import KaiClient
+from kai_client import KaiBackend, KaiClient
 
 # Load credentials from .env.local (same as the kai CLI)
 _env_local = Path(__file__).resolve().parent.parent / ".env.local"
@@ -32,6 +32,9 @@ st.title("Kai Chat")
 
 token = os.environ.get("STORAGE_API_TOKEN", "")
 api_url = os.environ.get("STORAGE_API_URL", "")
+# Injected automatically into every Data App container by Keboola — pins Kai's queries to
+# this app's own workspace instead of the default per-branch one. Unset outside a Data App.
+workspace_id = os.environ.get("WORKSPACE_ID") or None
 
 if not token or not api_url:
     st.error(
@@ -103,10 +106,18 @@ def run_async(coro):
 
 
 async def get_client() -> KaiClient:
-    """Create a KaiClient with auto-discovered URL."""
+    """Create a KaiClient with auto-discovered URL.
+
+    Pinned to the legacy kai-assistant backend because the approval handling
+    below uses approve_tool / reject_tool, which kai-agent does not support.
+    Streamlit's rerun model cannot hold the send_message stream open across the
+    approve/deny button click, which is what kai-agent's submit_approval needs.
+    """
     return await KaiClient.from_storage_api(
         storage_api_token=token,
         storage_api_url=api_url,
+        service=KaiBackend.ASSISTANT,
+        workspace_id=workspace_id,
     )
 
 
