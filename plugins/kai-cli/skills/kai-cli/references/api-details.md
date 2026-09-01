@@ -6,6 +6,14 @@ All Kai API requests require two headers:
 - `x-storageapi-token`: Keboola Storage API token
 - `x-storageapi-url`: Keboola Storage API URL (e.g., `https://connection.keboola.com`)
 
+One optional header is sent when a workspace is pinned (see
+[Workspace Pinning](#workspace-pinning)):
+- `x-workspace-id`: Keboola workspace ID to run Kai's queries against
+
+`ping()` is the only unauthenticated call — `/ping` is public on both backends.
+Every other method, `info()` included, sends the auth headers: `/api` requires
+credentials on kai-agent.
+
 ## Client Configuration
 
 ### Production Mode (Auto-Discovery)
@@ -61,6 +69,42 @@ kai --service assistant chat -m "Hello"   # legacy backend
 The flag also reads the `KAI_SERVICE` environment variable and accepts the full
 service ids (`kai-agent`, `kai-assistant`). It is ignored when `--base-url` is
 given.
+
+### Workspace Pinning
+
+By default Kai queries the project's per-branch workspace. Pass `workspace_id` to
+pin its queries to a specific workspace instead — forwarded as the
+`x-workspace-id` header on every request. It works on both backends, and on both
+the factory and the constructor:
+
+```python
+client = await KaiClient.from_storage_api(
+    storage_api_token="your-token",
+    storage_api_url="https://connection.keboola.com",
+    workspace_id="12345",
+)
+
+client = KaiClient(
+    storage_api_token="your-token",
+    storage_api_url="https://connection.keboola.com",
+    base_url="http://localhost:3000",
+    workspace_id="12345",
+)
+```
+
+`workspace_id` is independent of `service` — set either, both, or neither.
+Leaving it unset (the default) omits the header.
+
+The CLI equivalent reads the `WORKSPACE_ID` environment variable, which Keboola
+already injects into every Data App container, so Kai calls made from inside a
+Data App target that app's own — potentially more restricted — workspace with no
+extra configuration:
+
+```bash
+kai --workspace-id "12345" chat -m "What tables can I see?"
+```
+
+Unlike `--service`, `--workspace-id` still applies when `--base-url` is given.
 
 ### Backend Support
 

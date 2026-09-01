@@ -69,6 +69,13 @@ When Kai calls a write operation, streaming pauses and emits:
 
 Send an approval response via `POST /api/chat` with a `tool-approval-response` message part to resume.
 
+> **kai-assistant only.** `tool-approval-request` / `tool-approval-response` is a
+> Vercel-AI-SDK-v6 protocol that the modern `kai-agent` backend does not
+> implement — which is why this skill discovers `kai-assistant`. On `kai-agent`
+> the stream stays open and blocked instead, and the decision is POSTed to a
+> separate approval endpoint; see the `kai-cli` skill's
+> `references/api-details.md`.
+
 ## Next Actions
 
 Kai may append suggested actions at the end of a response in a fenced code block:

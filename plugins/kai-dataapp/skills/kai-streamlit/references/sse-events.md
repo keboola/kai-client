@@ -52,6 +52,14 @@ ToolApprovalRequestEvent(
 
 After approval/rejection, streaming resumes with the same event types.
 
+> **kai-assistant only.** `approve_tool()` / `reject_tool()` use a
+> Vercel-AI-SDK-v6 protocol the modern `kai-agent` backend does not implement,
+> and `from_storage_api()` defaults to `kai-agent` — so pass
+> `service=KaiBackend.ASSISTANT` when building on this flow. On `kai-agent` the
+> decision goes to `submit_approval()` while the original `send_message()` stream
+> is still open, which does not fit Streamlit's rerun model. See the `kai-cli`
+> skill's `references/api-details.md` for that protocol.
+
 ## Next Actions
 
 Kai may append suggested actions at the end of a response in a fenced code block:

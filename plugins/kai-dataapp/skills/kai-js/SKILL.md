@@ -41,6 +41,24 @@ In Keboola production, credentials come from environment variables mapped from D
 > run against the app's own workspace instead of the default per-branch one. It's normally empty
 > locally, which is fine — the header is simply omitted.
 
+### Backend
+
+Keboola exposes two AI backends: `kai-agent` (modern) and `kai-assistant`
+(legacy, single-tenant deployments only). **The patterns in this skill target
+`kai-assistant`**, and the discovery below looks that service id up deliberately.
+
+That is not an oversight, and it differs from the Python `kai-client` library,
+which defaults to `kai-agent`. The reason is the approval protocol: this skill's
+tool-approval flow uses `tool-approval-request` / `tool-approval-response`, a
+Vercel-AI-SDK-v6 protocol that `kai-agent` does not implement. Pointing the
+discovery below at `kai-agent` without also rewriting the approval flow will
+produce an app whose write operations hang.
+
+On `kai-agent` the decision is instead POSTed to a separate approval endpoint
+while the original chat stream stays open and blocked — see the `kai-cli`
+skill's `references/api-details.md` for that protocol. Porting these JS patterns
+to it is not done yet.
+
 ## Critical Patterns
 
 ### 1. Express Backend as Auth Proxy
