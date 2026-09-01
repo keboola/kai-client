@@ -63,8 +63,21 @@ def run_async(coro):
         "Ignored with --base-url."
     ),
 )
+@click.option(
+    "--workspace-id",
+    envvar="WORKSPACE_ID",
+    help="Pin Kai's queries to this Keboola workspace ID (or set WORKSPACE_ID env var, "
+    "already injected into Data App containers)",
+)
 @click.pass_context
-def main(ctx, token: Optional[str], url: Optional[str], base_url: Optional[str], service: str):
+def main(
+    ctx,
+    token: Optional[str],
+    url: Optional[str],
+    base_url: Optional[str],
+    service: str,
+    workspace_id: Optional[str],
+):
     """
     Kai CLI - Command-line interface for the Keboola AI Assistant.
 
@@ -93,6 +106,7 @@ def main(ctx, token: Optional[str], url: Optional[str], base_url: Optional[str],
     ctx.obj["url"] = url
     ctx.obj["base_url"] = base_url
     ctx.obj["service"] = service
+    ctx.obj["workspace_id"] = workspace_id
 
 
 async def get_client(ctx) -> KaiClient:
@@ -100,6 +114,7 @@ async def get_client(ctx) -> KaiClient:
     token = ctx.obj.get("token") or get_env_or_error("STORAGE_API_TOKEN")
     url = ctx.obj.get("url") or get_env_or_error("STORAGE_API_URL")
     base_url = ctx.obj.get("base_url")
+    workspace_id = ctx.obj.get("workspace_id")
 
     if base_url:
         # Local development mode
@@ -107,6 +122,7 @@ async def get_client(ctx) -> KaiClient:
             storage_api_token=token,
             storage_api_url=url,
             base_url=base_url,
+            workspace_id=workspace_id,
         )
 
     # Production mode - auto-discover URL
@@ -121,6 +137,7 @@ async def get_client(ctx) -> KaiClient:
         storage_api_token=token,
         storage_api_url=url,
         service=service,
+        workspace_id=workspace_id,
     )
 
 

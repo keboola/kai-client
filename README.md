@@ -199,11 +199,17 @@ kai --base-url http://localhost:3000 chat -m "Hello"
 # Choose which backend to auto-discover (default: agent)
 kai --service assistant chat -m "Hello"   # legacy backend
 KAI_SERVICE=assistant kai chat -m "Hello" # same, via env var
+
+# Pin Kai's queries to a specific workspace (e.g. a Data App's own WORKSPACE_ID)
+kai --workspace-id "12345" chat -m "What tables can I see?"
 ```
 
 `--service` accepts `agent` / `assistant` (or the full service ids `kai-agent` /
 `kai-assistant`) and is read from `KAI_SERVICE` when not passed. It is ignored
 when `--base-url` is given, since that skips discovery entirely.
+
+`--workspace-id` also reads the `WORKSPACE_ID` env var, which Keboola already injects into
+Data App containers — so inside a Data App you typically don't need to pass it explicitly.
 
 ### Help
 
@@ -446,7 +452,8 @@ client = await KaiClient.from_storage_api(
     storage_api_url: str,          # Keboola connection URL (e.g., https://connection.keboola.com)
     service: KaiBackend = KaiBackend.AGENT,  # Backend to discover (keyword-only)
     timeout: float = 300.0,        # Request timeout in seconds
-    stream_timeout: float = 600.0  # Streaming timeout in seconds
+    stream_timeout: float = 600.0,  # Streaming timeout in seconds
+    workspace_id: str | None = None,  # Pin queries to this workspace (e.g. a Data App's WORKSPACE_ID)
 )
 ```
 
@@ -484,7 +491,8 @@ KaiClient(
     base_url: str = "http://localhost:3000",  # Kai API base URL
     timeout: float = 300.0,      # Request timeout in seconds
     stream_timeout: float = 600.0,  # Streaming timeout in seconds
-    backend: KaiBackend | None = None  # Which backend base_url points at, if known
+    backend: KaiBackend | None = None,  # Which backend base_url points at, if known
+    workspace_id: str | None = None,  # Pin queries to this workspace (e.g. a Data App's WORKSPACE_ID)
 )
 ```
 
@@ -492,6 +500,12 @@ KaiClient(
 `from_storage_api()`, and stays `None` here — the backend behind an arbitrary
 `base_url` is unknown. Pass `backend=` explicitly if your code needs to branch
 on it (for example to pick an approval flow).
+
+> **Data Apps:** when Kai is embedded inside a running Data App, pass that app's own
+> `WORKSPACE_ID` env var (Keboola injects it into every Data App container) as `workspace_id`
+> so Kai's queries run against the app's own — potentially more restricted — workspace instead
+> of the default per-branch one. This is forwarded as the `x-workspace-id` header on every
+> request.
 
 #### Methods
 

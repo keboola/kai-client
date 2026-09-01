@@ -25,6 +25,7 @@ require("dotenv").config({ path: ".env.local" });
 
 const TOKEN = process.env.STORAGE_API_TOKEN || process.env.KBC_TOKEN || "";
 const API_URL = process.env.STORAGE_API_URL || process.env.KBC_URL || "";
+const WORKSPACE_ID = process.env.WORKSPACE_ID || "";
 ```
 
 `.env.local`:
@@ -34,6 +35,11 @@ STORAGE_API_URL=https://connection.keboola.com
 ```
 
 In Keboola production, credentials come from environment variables mapped from Data App secrets.
+
+> **`WORKSPACE_ID`** is injected automatically into every Data App container by Keboola — you
+> don't set it yourself. Forward it as the `x-workspace-id` header (see below) so Kai's queries
+> run against the app's own workspace instead of the default per-branch one. It's normally empty
+> locally, which is fine — the header is simply omitted.
 
 ## Critical Patterns
 
@@ -54,6 +60,7 @@ async function proxySSE(payload, res) {
       "Content-Type": "application/json",
       "x-storageapi-token": TOKEN,
       "x-storageapi-url": API_URL,
+      ...(WORKSPACE_ID && { "x-workspace-id": WORKSPACE_ID }),
     },
     body: JSON.stringify(payload),
   });
