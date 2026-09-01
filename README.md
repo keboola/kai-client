@@ -302,6 +302,38 @@ async with KaiClient(
                 print(f"\n[Done: {event.finish_reason}]")
 ```
 
+### Restricting Tool Usage
+
+Pass `tool_restrictions` to limit which tools the assistant may use. All three
+fields are optional and independent — provide any combination:
+
+```python
+from kai_client import KaiClient, ToolRestrictions
+
+async with KaiClient(
+    storage_api_token="your-token",
+    storage_api_url="https://connection.keboola.com"
+) as client:
+    chat_id = client.new_chat_id()
+
+    async for event in client.send_message(
+        chat_id,
+        "Show me my tables",
+        tool_restrictions=ToolRestrictions(
+            allowed_tools=["list_tables", "get_table_detail"],  # allowlist
+            disallowed_tools=["run_job"],                        # denylist
+            read_only_mode=True,                                 # read-only tools only
+        ),
+    ):
+        if event.type == "text":
+            print(event.text, end="")
+```
+
+Restrictions serialize to `toolRestrictions: {allowedTools, disallowedTools, readOnlyMode}`
+on `POST /api/chat`. They are **first-message-wins**: the backend persists the
+restrictions from the first message of a chat and silently ignores
+`tool_restrictions` sent on follow-up messages of the same chat.
+
 ### Chat History
 
 ```python

@@ -64,6 +64,7 @@ from kai_client.models import (
     ToolCallPart,
     ToolInfo,
     ToolOutputErrorEvent,
+    ToolRestrictions,
     ToolResultPart,
     ToolsListResponse,
     UnknownEvent,
@@ -108,6 +109,7 @@ __all__ = [
     "ToolResultPart",
     "ToolApprovalResponsePart",
     "ToolCallPart",
+    "ToolRestrictions",
     "MessageMetadata",
     "RequestContext",
     # Response models

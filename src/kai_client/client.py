@@ -30,6 +30,7 @@ from kai_client.models import (
     SuggestionsResponse,
     TextPart,
     ToolInfo,
+    ToolRestrictions,
     ToolResultPart,
     ToolsListResponse,
     UsageResponse,
@@ -441,6 +442,7 @@ class KaiClient:
         branch_id: Optional[int] = None,
         hidden: bool = False,
         request_path: Optional[str] = None,
+        tool_restrictions: Optional[ToolRestrictions] = None,
     ) -> AsyncIterator[SSEEvent]:
         """
         Send a message and stream the response.
@@ -455,6 +457,14 @@ class KaiClient:
             branch_id: Optional Keboola branch ID.
             hidden: Whether the message should be hidden.
             request_path: Optional path context for the request.
+            tool_restrictions: Optional restrictions on which tools the
+                assistant may use. Provide an allowlist (``allowed_tools``),
+                a denylist (``disallowed_tools``), and/or read-only mode
+                (``read_only_mode``). When ``None`` (the default), no
+                ``toolRestrictions`` field is sent. Restrictions are
+                **first-message-wins**: the backend persists them from the
+                first message of a chat and silently ignores this argument on
+                follow-up messages of the same chat.
 
         Yields:
             SSE events from the response stream.
@@ -487,6 +497,7 @@ class KaiClient:
             selected_chat_model="chat-model",
             selected_visibility_type=_normalize_visibility(visibility),
             branch_id=branch_id,
+            tool_restrictions=tool_restrictions,
         )
 
         # Serialize with aliases

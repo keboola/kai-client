@@ -153,6 +153,26 @@ const payload = {
 
 > **Gotcha:** Non-UUID strings (like `"test-123"`) cause a 400 Bad Request.
 
+To restrict which tools the assistant may use, add an optional `toolRestrictions`
+object. All three fields are optional and independent:
+
+```javascript
+const payload = {
+  id: crypto.randomUUID(),
+  message: { /* ... */ },
+  selectedChatModel: "chat-model",
+  selectedVisibilityType: "private",
+  toolRestrictions: {
+    allowedTools: ["list_tables", "get_table_detail"], // allowlist
+    disallowedTools: ["run_job"],                        // denylist
+    readOnlyMode: true,                                  // read-only tools only
+  },
+};
+```
+
+> **First-message-wins:** the backend persists `toolRestrictions` from the first
+> message of a chat and ignores it on follow-up messages of the same chat.
+
 ### 4. SSE Format
 
 Kai's SSE uses **data-only lines** with the event type inside the JSON — no `event:` lines:

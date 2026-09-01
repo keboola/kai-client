@@ -15,6 +15,7 @@ from kai_client import (
     KaiForbiddenError,
     KaiNotFoundError,
     KaiRateLimitError,
+    ToolRestrictions,
 )
 
 
@@ -1251,6 +1252,90 @@ class TestSendMessageOptions:
         request = httpx_mock.get_request()
         body = json.loads(request.content)
         assert body["branchId"] == 12345
+
+    @pytest.mark.asyncio
+    async def test_send_message_with_tool_restrictions(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        """Test send_message serializes toolRestrictions with camelCase keys."""
+        sse_response = 'data: {"type":"finish","finishReason":"stop"}\n'
+
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/chat",
+            method="POST",
+            content=sse_response.encode(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        async with client:
+            async for _ in client.send_message(
+                "chat-123",
+                "Test",
+                tool_restrictions=ToolRestrictions(
+                    allowed_tools=["list_tables"],
+                    disallowed_tools=["run_job"],
+                    read_only_mode=True,
+                ),
+            ):
+                pass
+
+        request = httpx_mock.get_request()
+        body = json.loads(request.content)
+        assert body["toolRestrictions"] == {
+            "allowedTools": ["list_tables"],
+            "disallowedTools": ["run_job"],
+            "readOnlyMode": True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_send_message_without_tool_restrictions(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        """Test that toolRestrictions is absent when not provided."""
+        sse_response = 'data: {"type":"finish","finishReason":"stop"}\n'
+
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/chat",
+            method="POST",
+            content=sse_response.encode(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        async with client:
+            async for _ in client.send_message("chat-123", "Test"):
+                pass
+
+        request = httpx_mock.get_request()
+        body = json.loads(request.content)
+        assert "toolRestrictions" not in body
+
+    @pytest.mark.asyncio
+    async def test_send_message_tool_restrictions_omits_empty_sub_fields(
+        self, client: KaiClient, httpx_mock: HTTPXMock
+    ):
+        """Test that unset toolRestrictions sub-fields are omitted from the body."""
+        sse_response = 'data: {"type":"finish","finishReason":"stop"}\n'
+
+        httpx_mock.add_response(
+            url="http://localhost:3000/api/chat",
+            method="POST",
+            content=sse_response.encode(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        async with client:
+            async for _ in client.send_message(
+                "chat-123",
+                "Test",
+                tool_restrictions=ToolRestrictions(read_only_mode=True),
+            ):
+                pass
+
+        request = httpx_mock.get_request()
+        body = json.loads(request.content)
+        assert body["toolRestrictions"] == {"readOnlyMode": True}
+        assert "allowedTools" not in body["toolRestrictions"]
+        assert "disallowedTools" not in body["toolRestrictions"]
 
     @pytest.mark.asyncio
     async def test_send_message_with_metadata(self, client: KaiClient, httpx_mock: HTTPXMock):
