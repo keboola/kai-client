@@ -24,7 +24,7 @@ if env_file.exists():
             key, value = line.split("=", 1)
             os.environ[key.strip()] = value.strip()
 
-from kai_client import KaiClient, ToolCallEvent  # noqa: E402
+from kai_client import KaiBackend, KaiClient, ToolCallEvent  # noqa: E402
 
 
 async def run_with_auto_approve(client: KaiClient, message: str):
@@ -189,9 +189,15 @@ Examples:
     else:
         print("Server: PRODUCTION (auto-discovering...)")
         try:
+            # This example demonstrates the legacy v6 / tool-result approval
+            # flow (confirm_tool / deny_tool), which only the kai-assistant
+            # backend supports — so it pins discovery to that backend instead
+            # of the kai-agent default. On kai-agent, use submit_approval from
+            # inside the send_message stream (see the README).
             client = await KaiClient.from_storage_api(
                 storage_api_token=token,
                 storage_api_url=url,
+                service=KaiBackend.ASSISTANT,
             )
             print(f"Discovered Kai URL: {client.base_url}")
         except Exception as e:

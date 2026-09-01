@@ -77,6 +77,7 @@ from kai_client.models import (
 from kai_client.sse import SSEStreamParser, parse_sse_event, parse_sse_stream
 from kai_client.types import (
     FinishReason,
+    KaiBackend,
     MessageRole,
     SSEEventType,
     ToolCallState,
@@ -84,7 +85,7 @@ from kai_client.types import (
     VoteType,
 )
 
-__version__ = "0.12.0"
+__version__ = "0.13.0"
 
 __all__ = [
     # Main client
@@ -145,6 +146,7 @@ __all__ = [
     "parse_sse_stream",
     "parse_sse_event",
     # Enums
+    "KaiBackend",
     "VisibilityType",
     "VoteType",
     "MessageRole",

@@ -64,26 +64,38 @@ Indicate tool execution at various stages:
 
 ### Approval Workflow
 
-When `state` is `input-available`, the tool requires user approval:
+When `state` is `input-available`, a tool may be waiting for user approval. On
+the default **kai-agent** backend the stream stays open and blocked until the
+decision is POSTed, so answer with `submit_approval` from inside the loop and
+keep iterating — the same stream carries the tool output afterwards:
 
 ```python
 async for event in client.send_message(chat_id, text):
-    if isinstance(event, ToolCallEvent):
-        if event.state == "input-available":
-            print(f"Tool {event.tool_name} needs approval")
-            print(f"Input: {event.input}")
+    process_event(event)
 
-            if user_approves:
-                async for result in client.confirm_tool(
-                    chat_id, event.tool_call_id, event.tool_name
-                ):
-                    process_event(result)
-            else:
-                async for result in client.deny_tool(
-                    chat_id, event.tool_call_id, event.tool_name
-                ):
-                    process_event(result)
+    if isinstance(event, ToolCallEvent) and event.state == "input-available":
+        print(f"Tool {event.tool_name} needs approval")
+        print(f"Input: {event.input}")
+
+        await client.submit_approval(
+            chat_id=chat_id,
+            tool_use_id=event.tool_call_id,
+            approved=user_approves,
+            # reason="Not right now",
+        )
 ```
+
+`submit_approval` is a non-streaming POST returning an `ApprovalResponse`.
+Read-only tools that the backend executes on its own also pass through
+`input-available`; an approval submitted for one of those returns a "no pending
+approval" error that is safe to ignore.
+
+On the legacy **kai-assistant** backend the first stream ends instead, and the
+decision is sent with `client.approve_tool(chat_id, approval_id)` /
+`client.reject_tool(...)` — using the `approval_id` from the separate
+`tool-approval-request` event — or with the older `client.confirm_tool(...)` /
+`client.deny_tool(...)`. Each returns a new stream to consume. None of these
+work against kai-agent.
 
 ## Tool Output Error Events
 
@@ -157,16 +169,12 @@ async def process_chat(client, chat_id, text, auto_approve=False):
                 print(f"\n[Tool {event.tool_name} requires approval]")
                 print(f"Input: {json.dumps(event.input, indent=2)}")
 
-                if auto_approve or get_user_approval():
-                    async for e in client.confirm_tool(
-                        chat_id, event.tool_call_id, event.tool_name
-                    ):
-                        await process_event(e)
-                else:
-                    async for e in client.deny_tool(
-                        chat_id, event.tool_call_id, event.tool_name
-                    ):
-                        await process_event(e)
+                # kai-agent: unblocks this stream, which then continues below
+                await client.submit_approval(
+                    chat_id=chat_id,
+                    tool_use_id=event.tool_call_id,
+                    approved=auto_approve or get_user_approval(),
+                )
 
             case ToolCallEvent() if event.state == "output-available":
                 print(f"\n[Tool completed: {event.tool_name}]")

@@ -38,7 +38,7 @@ from kai_client.models import (
     VoteRequest,
 )
 from kai_client.sse import parse_sse_stream
-from kai_client.types import VisibilityType, VoteType
+from kai_client.types import KaiBackend, VisibilityType, VoteType
 
 # Sentinel for "caller did not pass this argument" — distinct from None (explicit clear).
 _UNSET: Any = object()
@@ -73,7 +73,7 @@ class KaiClient:
                 if event.type == "text":
                     print(event.text, end="", flush=True)
 
-        # Production (auto-discovers kai-assistant URL)
+        # Production (auto-discovers kai-agent URL)
         client = await KaiClient.from_storage_api(
             storage_api_token="your-token",
             storage_api_url="https://connection.keboola.com"
@@ -88,19 +88,24 @@ class KaiClient:
         cls,
         storage_api_token: str,
         storage_api_url: str,
+        *,
+        service: KaiBackend | str = KaiBackend.AGENT,
         timeout: float = 300.0,
         stream_timeout: float = 600.0,
         workspace_id: Optional[str] = None,
     ) -> "KaiClient":
         """
-        Auto-discover the kai-assistant URL from the Keboola Storage API.
+        Auto-discover the Kai backend URL (defaults to kai-agent) from the Keboola Storage API.
 
-        This factory method queries the Storage API to find the kai-assistant
+        This factory method queries the Storage API to find the requested
         service URL for your stack, then creates a client configured for production.
 
         Args:
             storage_api_token: Keboola Storage API token for authentication.
             storage_api_url: Keboola Storage API URL (e.g., https://connection.keboola.com).
+            service: Which backend to discover. Defaults to KaiBackend.AGENT
+                (the modern agent backend). Pass KaiBackend.ASSISTANT for the
+                legacy backend, or a raw service-id string.
             timeout: Default timeout for non-streaming requests in seconds.
             stream_timeout: Timeout for streaming requests in seconds.
             workspace_id: Optional Keboola workspace ID to pin Kai's queries to — e.g. a
@@ -111,7 +116,7 @@ class KaiClient:
             A configured KaiClient instance.
 
         Raises:
-            KaiError: If the kai-assistant service is not found or discovery fails.
+            KaiError: If the requested service is not found or discovery fails.
 
         Example:
             ```python
@@ -121,6 +126,8 @@ class KaiClient:
             )
             ```
         """
+        service_id = service.value if isinstance(service, KaiBackend) else service
+
         async with httpx.AsyncClient() as http_client:
             try:
                 response = await http_client.get(
@@ -132,7 +139,7 @@ class KaiClient:
                 data = response.json()
             except httpx.HTTPStatusError as e:
                 raise KaiError(
-                    message=f"Failed to discover kai-assistant URL: HTTP {e.response.status_code}",
+                    message=f"Failed to discover {service_id} URL: HTTP {e.response.status_code}",
                     code="discovery:http_error",
                 ) from e
             except httpx.RequestError as e:
@@ -143,23 +150,28 @@ class KaiClient:
 
         services = data.get("services", [])
         kai_service = next(
-            (s for s in services if s.get("id") == "kai-assistant"),
+            (s for s in services if s.get("id") == service_id),
             None,
         )
 
         if not kai_service:
             available = [s.get("id") for s in services]
             raise KaiError(
-                message=f"kai-assistant service not found. Available services: {available}",
+                message=f"{service_id} service not found. Available services: {available}",
                 code="discovery:service_not_found",
             )
 
         kai_url = kai_service.get("url")
         if not kai_url:
             raise KaiError(
-                message="kai-assistant service has no URL",
+                message=f"{service_id} service has no URL",
                 code="discovery:no_url",
             )
+
+        try:
+            backend: KaiBackend | None = KaiBackend(service_id)
+        except ValueError:
+            backend = None
 
         return cls(
             storage_api_token=storage_api_token,
@@ -167,6 +179,7 @@ class KaiClient:
             base_url=kai_url,
             timeout=timeout,
             stream_timeout=stream_timeout,
+            backend=backend,
             workspace_id=workspace_id,
         )
 
@@ -177,6 +190,7 @@ class KaiClient:
         base_url: str = "http://localhost:3000",
         timeout: float = 300.0,
         stream_timeout: float = 600.0,
+        backend: KaiBackend | None = None,
         workspace_id: Optional[str] = None,
     ) -> None:
         """
@@ -188,6 +202,8 @@ class KaiClient:
             base_url: Base URL for the Kai API (default: http://localhost:3000).
             timeout: Default timeout for non-streaming requests in seconds.
             stream_timeout: Timeout for streaming requests in seconds.
+            backend: The resolved KaiBackend this client targets, or None when
+                constructed directly (backend behind base_url is unknown).
             workspace_id: Optional Keboola workspace ID to pin Kai's queries to — e.g. a
                 Data App's own `WORKSPACE_ID` env var, so Kai queries that workspace
                 instead of the default per-branch one.
@@ -197,6 +213,7 @@ class KaiClient:
         self.storage_api_url = storage_api_url
         self.timeout = timeout
         self.stream_timeout = stream_timeout
+        self.backend = backend
         self.workspace_id = workspace_id
         self._client: Optional[httpx.AsyncClient] = None
 
@@ -325,12 +342,17 @@ class KaiClient:
         return str(uuid.uuid4())
 
     # =========================================================================
-    # Health & Info Endpoints (No Auth Required)
+    # Health & Info Endpoints
     # =========================================================================
+    # /ping is public on both backends. /api requires credentials on kai-agent
+    # (it returns 401 "Missing credentials" without them) and ignores them on
+    # kai-assistant, so info() always sends the auth headers.
 
     async def ping(self) -> PingResponse:
         """
         Check if the server is alive.
+
+        This endpoint is public on both backends, so no credentials are sent.
 
         Returns:
             PingResponse with the server timestamp.
@@ -342,10 +364,13 @@ class KaiClient:
         """
         Get server information including MCP connection status.
 
+        Sends the authentication headers: the kai-agent backend requires
+        credentials on ``/api``, and kai-assistant accepts them harmlessly.
+
         Returns:
             InfoResponse with server details.
         """
-        response = await self._request("GET", "/api", auth=False)
+        response = await self._request("GET", "/api")
         return InfoResponse.model_validate(response.json())
 
     # =========================================================================

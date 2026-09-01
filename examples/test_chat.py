@@ -50,7 +50,7 @@ async def main():
             base_url="http://localhost:3000",
         )
     else:
-        print("Mode: PRODUCTION (auto-discovering kai-assistant URL...)")
+        print("Mode: PRODUCTION (auto-discovering kai-agent URL...)")
         try:
             client = await KaiClient.from_storage_api(
                 storage_api_token=token,

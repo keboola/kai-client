@@ -34,6 +34,35 @@ cd kai-client
 uv sync
 ```
 
+## Breaking changes in 0.13.0
+
+Two intentional breaking changes ship in this release:
+
+1. **`from_storage_api()` discovers `kai-agent` instead of `kai-assistant`.**
+   The modern agent backend is now the default. To keep connecting to the legacy
+   backend (single-tenant deployments only), pass the `service` argument:
+
+   ```python
+   from kai_client import KaiBackend, KaiClient
+
+   client = await KaiClient.from_storage_api(
+       storage_api_token="your-token",
+       storage_api_url="https://connection.keboola.com",
+       service=KaiBackend.ASSISTANT,  # restores the pre-0.13.0 target
+   )
+   ```
+
+   The `kai` CLI follows the same default; use `kai --service assistant ...`
+   (or `KAI_SERVICE=assistant`) for the legacy backend.
+
+2. **`service`, `timeout` and `stream_timeout` are keyword-only.** A previously
+   legal positional call such as `from_storage_api(token, url, 60.0)` now raises
+   `TypeError`; pass `timeout=60.0` instead.
+
+Tool approvals on kai-agent use `submit_approval()`; the older `approve_tool` /
+`reject_tool` / `confirm_tool` / `deny_tool` methods remain for kai-assistant.
+See [Backend Support](#backend-support).
+
 ## Quick Start
 
 ```python
@@ -41,7 +70,7 @@ import asyncio
 from kai_client import KaiClient
 
 async def main():
-    # Production: Auto-discover the kai-assistant URL from your Keboola stack
+    # Production: Auto-discover the kai-agent URL from your Keboola stack
     client = await KaiClient.from_storage_api(
         storage_api_token="your-keboola-token",
         storage_api_url="https://connection.keboola.com"  # Your stack URL
@@ -167,9 +196,17 @@ kai --token "your-token" --url "https://connection.keboola.com" ping
 # Use a custom base URL for local development
 kai --base-url http://localhost:3000 chat -m "Hello"
 
+# Choose which backend to auto-discover (default: agent)
+kai --service assistant chat -m "Hello"   # legacy backend
+KAI_SERVICE=assistant kai chat -m "Hello" # same, via env var
+
 # Pin Kai's queries to a specific workspace (e.g. a Data App's own WORKSPACE_ID)
 kai --workspace-id "12345" chat -m "What tables can I see?"
 ```
+
+`--service` accepts `agent` / `assistant` (or the full service ids `kai-agent` /
+`kai-assistant`) and is read from `KAI_SERVICE` when not passed. It is ignored
+when `--base-url` is given, since that skips discovery entirely.
 
 `--workspace-id` also reads the `WORKSPACE_ID` env var, which Keboola already injects into
 Data App containers — so inside a Data App you typically don't need to pass it explicitly.
@@ -197,7 +234,7 @@ client = KaiClient(
     base_url="http://localhost:3000"
 )
 
-# Production (auto-discovers kai-assistant URL)
+# Production (auto-discovers kai-agent URL)
 client = await KaiClient.from_storage_api(
     storage_api_token="your-token",
     storage_api_url="https://connection.keboola.com"
@@ -306,46 +343,51 @@ async with KaiClient(
 
 ### Tool Approval for Write Operations
 
-Some tools (like `update_descriptions`, `run_job`, `create_config`) require explicit approval before execution. The server sends a `tool-approval-request` event with an `approval_id` that you use to approve or reject.
+Some tools (like `update_descriptions`, `run_job`, `create_config`) require
+explicit approval before execution. On **kai-agent** (the default backend) a
+tool waiting for approval appears as a `tool-call` event in the
+`input-available` state, and the stream stays open — and blocked — until you
+POST the decision with `submit_approval()`. So the decision has to be made from
+*inside* the streaming loop; the same stream then delivers the tool output and
+the rest of the answer.
 
 ```python
-from kai_client import KaiClient, ToolApprovalRequestEvent
+from kai_client import KaiClient
 
-async with KaiClient(
+client = await KaiClient.from_storage_api(
     storage_api_token="your-token",
-    storage_api_url="https://connection.keboola.com"
-) as client:
+    storage_api_url="https://connection.keboola.com",
+)
+
+async with client:
     chat_id = client.new_chat_id()
-    pending_approval_id = None
 
     async for event in client.send_message(chat_id, "Create a new bucket"):
         if event.type == "text":
             print(event.text, end="")
         elif event.type == "tool-call":
             if event.state == "input-available":
-                print(f"\nTool {event.tool_name} needs approval")
+                print(f"\nTool {event.tool_name} needs approval: {event.input}")
+                # Unblocks this stream; iteration continues with the result.
+                await client.submit_approval(
+                    chat_id=chat_id,
+                    tool_use_id=event.tool_call_id,
+                    approved=True,          # False to deny
+                    # reason="Not right now",
+                )
             elif event.state == "output-available":
                 print(f"\nTool {event.tool_name} completed")
-        elif event.type == "tool-approval-request":
-            pending_approval_id = event.approval_id
-
-    # Approve the pending tool
-    if pending_approval_id:
-        async for event in client.approve_tool(
-            chat_id=chat_id,
-            approval_id=pending_approval_id,
-        ):
-            if event.type == "text":
-                print(event.text, end="")
-
-    # Or reject it
-    # async for event in client.reject_tool(
-    #     chat_id=chat_id,
-    #     approval_id=pending_approval_id,
-    #     reason="Not right now",
-    # ):
-    #     ...
 ```
+
+Note that read-only tools the backend executes on its own also pass through
+`input-available`; submitting an approval for one of those returns a "no pending
+approval" error, which is safe to ignore.
+
+On the legacy **kai-assistant** backend the flow is different: the first stream
+ends, the server emits a separate `tool-approval-request` event carrying an
+`approval_id`, and you reply with `approve_tool()` / `reject_tool()` (or
+`confirm_tool()` / `deny_tool()` on older deployments), each of which returns a
+new stream.
 
 ### Using SSE Stream Parser
 
@@ -406,15 +448,39 @@ The main client class for interacting with the Kai API.
 
 ```python
 client = await KaiClient.from_storage_api(
-    storage_api_token: str,      # Keboola Storage API token
-    storage_api_url: str,        # Keboola connection URL (e.g., https://connection.keboola.com)
-    timeout: float = 300.0,      # Request timeout in seconds
+    storage_api_token: str,        # Keboola Storage API token
+    storage_api_url: str,          # Keboola connection URL (e.g., https://connection.keboola.com)
+    service: KaiBackend = KaiBackend.AGENT,  # Backend to discover (keyword-only)
+    timeout: float = 300.0,        # Request timeout in seconds
     stream_timeout: float = 600.0,  # Streaming timeout in seconds
     workspace_id: str | None = None,  # Pin queries to this workspace (e.g. a Data App's WORKSPACE_ID)
 )
 ```
 
-This method auto-discovers the kai-assistant service URL from your Keboola stack.
+This method auto-discovers the **kai-agent** service URL from your Keboola stack
+(the modern agent backend). To target the legacy `kai-assistant` backend
+(single-tenant deployments only), pass `service=KaiBackend.ASSISTANT`.
+
+#### Backend Support
+
+`kai-client` targets the **kai-agent** backend by default. The following methods
+are supported against kai-agent:
+
+`ping`, `info`, `send_message`, `chat`, `submit_approval`, `get_chat`,
+`delete_chat`, `get_history` / `get_all_history`, `get_votes` / `vote` /
+`upvote` / `downvote`, `get_usage`, `get_settings` / `update_settings` /
+`get_user_settings` / `update_user_settings`, `get_tools`, `get_suggestions`.
+
+These methods use the older Vercel-AI-SDK-v6 / tool-result protocols and are
+**not supported by kai-agent** (kept only for the legacy backend):
+`send_tool_approval_response`, `approve_tool`, `reject_tool`, `send_tool_result`,
+`confirm_tool`, `deny_tool`, `resume_stream`. Use `submit_approval` for tool
+approvals on kai-agent.
+
+> This split is derived from the kai-agent route surface and the protocol notes
+> carried by the methods themselves; only `ping` has been confirmed against a
+> live kai-agent deployment, so treat individual entries as expected rather than
+> individually verified.
 
 #### Constructor (For Local Development)
 
@@ -425,9 +491,15 @@ KaiClient(
     base_url: str = "http://localhost:3000",  # Kai API base URL
     timeout: float = 300.0,      # Request timeout in seconds
     stream_timeout: float = 600.0,  # Streaming timeout in seconds
+    backend: KaiBackend | None = None,  # Which backend base_url points at, if known
     workspace_id: str | None = None,  # Pin queries to this workspace (e.g. a Data App's WORKSPACE_ID)
 )
 ```
+
+`client.backend` records the discovered backend when the client comes from
+`from_storage_api()`, and stays `None` here — the backend behind an arbitrary
+`base_url` is unknown. Pass `backend=` explicitly if your code needs to branch
+on it (for example to pick an approval flow).
 
 > **Data Apps:** when Kai is embedded inside a running Data App, pass that app's own
 > `WORKSPACE_ID` env var (Keboola injects it into every Data App container) as `workspace_id`
@@ -445,10 +517,11 @@ KaiClient(
 | `info()` | Get server information |
 | `send_message(chat_id, text, ...)` | Send a message and stream response |
 | `chat(text, ...)` | Simple non-streaming chat (returns text) |
-| `approve_tool(chat_id, approval_id, ...)` | Approve a pending tool call (v6 flow) |
-| `reject_tool(chat_id, approval_id, ...)` | Reject a pending tool call (v6 flow) |
-| `confirm_tool(chat_id, tool_call_id, ...)` | Approve a pending tool call (legacy flow) |
-| `deny_tool(chat_id, tool_call_id, ...)` | Deny a pending tool call (legacy flow) |
+| `submit_approval(chat_id, tool_use_id, approved, ...)` | Approve or deny a pending tool call (kai-agent) |
+| `approve_tool(chat_id, approval_id, ...)` | Approve a pending tool call (legacy v6 flow, kai-assistant only) |
+| `reject_tool(chat_id, approval_id, ...)` | Reject a pending tool call (legacy v6 flow, kai-assistant only) |
+| `confirm_tool(chat_id, tool_call_id, ...)` | Approve a pending tool call (legacy tool-result flow, kai-assistant only) |
+| `deny_tool(chat_id, tool_call_id, ...)` | Deny a pending tool call (legacy tool-result flow, kai-assistant only) |
 | `get_chat(chat_id)` | Get chat details with messages |
 | `get_history(limit, ...)` | Get chat history |
 | `get_all_history()` | Iterate through all history |

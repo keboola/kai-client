@@ -71,7 +71,7 @@ def run_async(coro):
 
 ### 2. Client Creation — Always Use `from_storage_api()`
 
-The `KaiClient()` constructor defaults `base_url` to `http://localhost:3000`. For production, you **must** use the async factory method which auto-discovers the real kai-assistant URL:
+The `KaiClient()` constructor defaults `base_url` to `http://localhost:3000`. For production, you **must** use the async factory method, which auto-discovers the real backend URL for the stack (the **kai-agent** backend by default):
 
 ```python
 async def get_client() -> KaiClient:
@@ -81,6 +81,13 @@ async def get_client() -> KaiClient:
         workspace_id=workspace_id,
     )
 ```
+
+> **Note:** the tool-approval pattern shown further down uses `approve_tool` /
+> `reject_tool`, which only work against the legacy kai-assistant backend. Add
+> `service=KaiBackend.ASSISTANT` to the call above when using it. On kai-agent
+> the decision goes to `submit_approval` while the original stream is still
+> open, which does not fit Streamlit's rerun model — see the README's "Tool
+> Approval for Write Operations" section.
 
 > **Gotcha:** Using `KaiClient(token, url)` directly causes `httpx.RemoteProtocolError: illegal request line` because it sends requests to localhost.
 

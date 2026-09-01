@@ -6,20 +6,37 @@ All Kai API requests require two headers:
 - `x-storageapi-token`: Keboola Storage API token
 - `x-storageapi-url`: Keboola Storage API URL (e.g., `https://connection.keboola.com`)
 
+One optional header is sent when a workspace is pinned (see
+[Workspace Pinning](#workspace-pinning)):
+- `x-workspace-id`: Keboola workspace ID to run Kai's queries against
+
+`ping()` is the only unauthenticated call — `/ping` is public on both backends.
+Every other method, `info()` included, sends the auth headers: `/api` requires
+credentials on kai-agent.
+
 ## Client Configuration
 
 ### Production Mode (Auto-Discovery)
 
-The Kai client automatically discovers the Kai API URL from the Keboola stack:
+The Kai client automatically discovers the Kai API URL from the Keboola stack
+(defaults to the **kai-agent** backend):
 
 ```python
-from kai_client import KaiClient
+from kai_client import KaiClient, KaiBackend
 
+# Defaults to kai-agent
 async with await KaiClient.from_storage_api(
     storage_api_token="your-token",
-    storage_api_url="https://connection.keboola.com"
+    storage_api_url="https://connection.keboola.com",
 ) as client:
     response = await client.ping()
+
+# Legacy backend (single-tenant deployments only)
+client = await KaiClient.from_storage_api(
+    storage_api_token="your-token",
+    storage_api_url="https://connection.keboola.com",
+    service=KaiBackend.ASSISTANT,
+)
 ```
 
 ### Local Development Mode
@@ -43,6 +60,69 @@ Or CLI flag:
 ```bash
 kai --base-url http://localhost:3000 chat -m "Hello"
 ```
+
+Select the backend for auto-discovery (default `agent`):
+```bash
+kai --service assistant chat -m "Hello"   # legacy backend
+```
+
+The flag also reads the `KAI_SERVICE` environment variable and accepts the full
+service ids (`kai-agent`, `kai-assistant`). It is ignored when `--base-url` is
+given.
+
+### Workspace Pinning
+
+By default Kai queries the project's per-branch workspace. Pass `workspace_id` to
+pin its queries to a specific workspace instead — forwarded as the
+`x-workspace-id` header on every request. It works on both backends, and on both
+the factory and the constructor:
+
+```python
+client = await KaiClient.from_storage_api(
+    storage_api_token="your-token",
+    storage_api_url="https://connection.keboola.com",
+    workspace_id="12345",
+)
+
+client = KaiClient(
+    storage_api_token="your-token",
+    storage_api_url="https://connection.keboola.com",
+    base_url="http://localhost:3000",
+    workspace_id="12345",
+)
+```
+
+`workspace_id` is independent of `service` — set either, both, or neither.
+Leaving it unset (the default) omits the header.
+
+The CLI equivalent reads the `WORKSPACE_ID` environment variable, which Keboola
+already injects into every Data App container, so Kai calls made from inside a
+Data App target that app's own — potentially more restricted — workspace with no
+extra configuration:
+
+```bash
+kai --workspace-id "12345" chat -m "What tables can I see?"
+```
+
+Unlike `--service`, `--workspace-id` still applies when `--base-url` is given.
+
+### Backend Support
+
+Supported against **kai-agent** (the default): `ping`, `info`, `send_message`,
+`chat`, `submit_approval`, `get_chat`, `delete_chat`, `get_history` /
+`get_all_history`, `get_votes` / `vote` / `upvote` / `downvote`, `get_usage`,
+`get_settings` / `update_settings` / `get_user_settings` /
+`update_user_settings`, `get_tools`, `get_suggestions`.
+
+**Not supported by kai-agent** — these use the older Vercel-AI-SDK-v6 /
+tool-result protocols and only work against the legacy kai-assistant backend:
+`send_tool_approval_response`, `approve_tool`, `reject_tool`, `send_tool_result`,
+`confirm_tool`, `deny_tool`, `resume_stream`.
+
+This split is derived from the kai-agent route surface and the protocol notes
+carried by the methods themselves; only `ping` has been confirmed against a live
+kai-agent deployment, so treat individual entries as expected rather than
+individually verified.
 
 ## API Methods
 
@@ -96,25 +176,32 @@ async for event in client.send_message(
 
 ### Tool Approval
 
-When the AI needs to execute operations, it sends a `ToolCallEvent` with `state="input-available"`:
+When the AI needs to execute a write operation, it sends a `ToolCallEvent` with
+`state="input-available"`. On **kai-agent** the stream stays open and blocked
+until the decision is submitted, so call `submit_approval` from inside the
+streaming loop — the same stream then continues with the tool output:
 
 ```python
-# Approve the tool call
-async for event in client.confirm_tool(
-    chat_id=chat_id,
-    tool_call_id=tool_event.tool_call_id,
-    tool_name=tool_event.tool_name,
-):
-    # Process results
-
-# Deny the tool call
-async for event in client.deny_tool(
-    chat_id=chat_id,
-    tool_call_id=tool_event.tool_call_id,
-    tool_name=tool_event.tool_name,
-):
-    # Process denial response
+async for event in client.send_message(chat_id, "Create a bucket"):
+    if event.type == "tool-call" and event.state == "input-available":
+        await client.submit_approval(
+            chat_id=chat_id,
+            tool_use_id=event.tool_call_id,  # the toolCallId of that event
+            approved=True,                   # False to deny
+            # reason="Not right now",
+        )
 ```
+
+`submit_approval` is a plain POST (not a stream) and returns an
+`ApprovalResponse`. Read-only tools the backend runs on its own also pass
+through `input-available`; submitting an approval for one of them returns a
+"no pending approval" error that is safe to ignore.
+
+On the legacy **kai-assistant** backend the first stream ends instead, and the
+reply is sent with `approve_tool` / `reject_tool` (v6 flow, using the
+`approval_id` from the `tool-approval-request` event) or `confirm_tool` /
+`deny_tool` (older tool-result flow). Each of those returns a new stream. None
+of them work against kai-agent.
 
 ### History Management
 

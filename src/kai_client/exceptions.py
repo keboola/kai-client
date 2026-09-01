@@ -72,6 +72,57 @@ ERROR_CODE_MAP: dict[str, type[KaiError]] = {
     "bad_request:api": KaiBadRequestError,
 }
 
+# kai-agent error *types* (the `error.type` field of its envelope) to exception
+# classes. Types with no dedicated class (conflict, payload_too_large, offline,
+# bad_response, internal) fall through to the base KaiError.
+AGENT_ERROR_TYPE_MAP: dict[str, type[KaiError]] = {
+    "bad_request": KaiBadRequestError,
+    "unauthorized": KaiAuthenticationError,
+    "forbidden": KaiForbiddenError,
+    "not_found": KaiNotFoundError,
+    "rate_limit": KaiRateLimitError,
+}
+
+
+def _parse_agent_error(response_data: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Recognize the kai-agent error envelope and flatten it.
+
+    kai-agent nests its error under an ``error`` key::
+
+        {"error": {"type": "not_found", "surface": "api",
+                   "message": "No pending approval found",
+                   "exceptionId": "KAI-..."}}
+
+    The legacy kai-assistant backend instead returns ``code``/``message`` at the
+    top level. Without this branch every kai-agent failure would fall through to
+    a bare ``KaiError("Unknown error")``, losing the message, the exception ID,
+    and the ability to tell a 404 from a 500.
+
+    ``type`` and ``surface`` are joined into the same ``type:surface`` code
+    format the legacy codes already use, so ``KaiError.code`` stays uniform
+    across backends.
+
+    Returns None if this is not a kai-agent envelope.
+    """
+    error = response_data.get("error")
+    if not isinstance(error, dict):
+        return None
+
+    error_type = error.get("type")
+    message = error.get("message")
+    if not isinstance(error_type, str) or not isinstance(message, str):
+        return None
+
+    surface = error.get("surface")
+    code = f"{error_type}:{surface}" if isinstance(surface, str) else error_type
+
+    return {
+        "exception_class": AGENT_ERROR_TYPE_MAP.get(error_type, KaiError),
+        "message": message,
+        "code": code,
+        "cause": error.get("exceptionId"),
+    }
+
 
 def raise_for_error_response(response_data: dict[str, Any]) -> None:
     """
@@ -83,6 +134,15 @@ def raise_for_error_response(response_data: dict[str, Any]) -> None:
     Raises:
         KaiError: The appropriate exception subclass based on the error code.
     """
+    agent_error = _parse_agent_error(response_data)
+    if agent_error is not None:
+        raise agent_error["exception_class"](
+            message=agent_error["message"],
+            code=agent_error["code"],
+            cause=agent_error["cause"],
+            response_data=response_data,
+        )
+
     code = response_data.get("code", "")
     message = response_data.get("message", "Unknown error")
     cause = response_data.get("cause")

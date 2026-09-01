@@ -3,6 +3,7 @@
 import pytest
 
 from kai_client.exceptions import (
+    AGENT_ERROR_TYPE_MAP,
     ERROR_CODE_MAP,
     KaiAuthenticationError,
     KaiBadRequestError,
@@ -211,5 +212,101 @@ class TestRaiseForErrorResponse:
         with pytest.raises(KaiError) as exc_info:
             raise_for_error_response(response_data)
         assert exc_info.value.response_data == response_data
+
+
+class TestAgentErrorEnvelope:
+    """The kai-agent backend nests its error under an ``error`` key.
+
+    Shape (from kai-agent's errorResponseSchema)::
+
+        {"error": {"type", "surface", "message", "subtype"?, "exceptionId"?}}
+
+    Before this was handled, every kai-agent failure produced a bare
+    ``KaiError("Unknown error")`` — losing the message, the exception ID, and
+    any way to distinguish a 404 from a 500.
+    """
+
+    @pytest.mark.parametrize(
+        "error_type,expected",
+        [
+            ("not_found", KaiNotFoundError),
+            ("unauthorized", KaiAuthenticationError),
+            ("forbidden", KaiForbiddenError),
+            ("bad_request", KaiBadRequestError),
+            ("rate_limit", KaiRateLimitError),
+            # Types with no dedicated class fall back to the base error.
+            ("internal", KaiError),
+            ("conflict", KaiError),
+            ("offline", KaiError),
+            ("bad_response", KaiError),
+            ("payload_too_large", KaiError),
+        ],
+    )
+    def test_error_type_maps_to_exception_class(self, error_type, expected):
+        payload = {
+            "error": {"type": error_type, "surface": "api", "message": "boom"}
+        }
+        with pytest.raises(KaiError) as exc_info:
+            raise_for_error_response(payload)
+        assert type(exc_info.value) is expected
+
+    def test_message_and_exception_id_preserved(self):
+        """The real message and exceptionId must survive — this is what makes
+        a kai-agent failure debuggable."""
+        payload = {
+            "error": {
+                "type": "not_found",
+                "surface": "api",
+                "message": "No pending approval found",
+                "exceptionId": "KAI-abc123-deadbeef",
+            }
+        }
+        with pytest.raises(KaiNotFoundError) as exc_info:
+            raise_for_error_response(payload)
+
+        err = exc_info.value
+        assert err.message == "No pending approval found"
+        assert err.code == "not_found:api"
+        assert err.cause == "KAI-abc123-deadbeef"
+        assert err.response_data == payload
+        assert "Unknown error" not in str(err)
+
+    def test_missing_surface_falls_back_to_bare_type(self):
+        payload = {"error": {"type": "internal", "message": "boom"}}
+        with pytest.raises(KaiError) as exc_info:
+            raise_for_error_response(payload)
+        assert exc_info.value.code == "internal"
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"error": "a string, not an object"},
+            {"error": {"surface": "api", "message": "no type"}},
+            {"error": {"type": "not_found", "surface": "api"}},  # no message
+            {"error": {"type": 500, "message": "type not a string"}},
+        ],
+        ids=["error_not_dict", "no_type", "no_message", "type_not_str"],
+    )
+    def test_non_conforming_envelope_falls_through_to_legacy(self, payload):
+        """A malformed envelope must not crash — it falls back to legacy parsing."""
+        with pytest.raises(KaiError) as exc_info:
+            raise_for_error_response(payload)
+        assert type(exc_info.value) is KaiError
+
+    def test_legacy_top_level_format_still_works(self):
+        """kai-assistant's flat code/message format must keep working."""
+        with pytest.raises(KaiNotFoundError) as exc_info:
+            raise_for_error_response({"code": "not_found:chat", "message": "gone"})
+        assert exc_info.value.message == "gone"
+        assert exc_info.value.code == "not_found:chat"
+
+    def test_agent_map_covers_the_classed_types(self):
+        assert AGENT_ERROR_TYPE_MAP == {
+            "bad_request": KaiBadRequestError,
+            "unauthorized": KaiAuthenticationError,
+            "forbidden": KaiForbiddenError,
+            "not_found": KaiNotFoundError,
+            "rate_limit": KaiRateLimitError,
+        }
 
 

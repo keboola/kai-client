@@ -8,6 +8,7 @@ from pytest_httpx import HTTPXMock
 
 from kai_client import (
     KaiAuthenticationError,
+    KaiBackend,
     KaiBadRequestError,
     KaiClient,
     KaiError,
@@ -55,6 +56,15 @@ class TestKaiClientInit:
         assert client.timeout == 60.0
         assert client.stream_timeout == 120.0
 
+    def test_direct_construction_has_unknown_backend(self):
+        """Direct construction leaves backend None — the backend behind an
+        arbitrary base_url is unknown (only discovery can record it)."""
+        client = KaiClient(
+            storage_api_token="token",
+            storage_api_url="https://connection.keboola.com",
+            base_url="http://localhost:3000",
+        )
+        assert client.backend is None
     def test_workspace_id_defaults_to_none(self):
         client = KaiClient(
             storage_api_token="token",
@@ -149,6 +159,28 @@ class TestInfo:
         assert response.app_name == "kai-backend"
         assert response.app_version == "1.0.0"
         assert len(response.connected_mcp) == 1
+
+    @pytest.mark.asyncio
+    async def test_info_sends_auth_headers(self, client: KaiClient, httpx_mock: HTTPXMock):
+        """Info must send auth headers: /api requires credentials on kai-agent."""
+        httpx_mock.add_response(
+            url="http://localhost:3000/api",
+            json={
+                "timestamp": "2025-12-24T16:24:10.641Z",
+                "uptime": 12345.67,
+                "appName": "kai-backend",
+                "appVersion": "1.0.0",
+                "serverVersion": "2.0.0",
+                "connectedMcp": [],
+            },
+        )
+
+        async with client:
+            await client.info()
+
+        request = httpx_mock.get_request()
+        assert request.headers["x-storageapi-token"] == "test-token"
+        assert request.headers["x-storageapi-url"] == "https://connection.test.keboola.com"
 
 
 class TestGetChat:
@@ -793,14 +825,14 @@ class TestFromStorageApi:
     """Tests for from_storage_api factory method."""
 
     @pytest.mark.asyncio
-    async def test_from_storage_api_success(self, httpx_mock: HTTPXMock):
-        """Test successful URL discovery from Storage API."""
+    async def test_defaults_to_agent(self, httpx_mock: HTTPXMock):
+        """Default discovery targets the kai-agent service."""
         httpx_mock.add_response(
             url="https://connection.keboola.com/v2/storage",
             json={
                 "services": [
-                    {"id": "kai-assistant", "url": "https://kai.keboola.com"},
-                    {"id": "other-service", "url": "https://other.keboola.com"},
+                    {"id": "kai-assistant", "url": "https://assistant.keboola.com"},
+                    {"id": "kai-agent", "url": "https://agent.keboola.com"},
                 ]
             },
         )
@@ -810,20 +842,75 @@ class TestFromStorageApi:
             storage_api_url="https://connection.keboola.com",
         )
 
-        assert client.base_url == "https://kai.keboola.com"
-        assert client.storage_api_token == "test-token"
+        assert client.base_url == "https://agent.keboola.com"
+        assert client.backend == KaiBackend.AGENT
         await client.close()
 
     @pytest.mark.asyncio
-    async def test_from_storage_api_service_not_found(self, httpx_mock: HTTPXMock):
-        """Test error when kai-assistant service is not in the list."""
+    async def test_explicit_assistant(self, httpx_mock: HTTPXMock):
+        """service=KaiBackend.ASSISTANT selects the legacy service."""
         httpx_mock.add_response(
             url="https://connection.keboola.com/v2/storage",
             json={
                 "services": [
-                    {"id": "other-service", "url": "https://other.keboola.com"},
+                    {"id": "kai-assistant", "url": "https://assistant.keboola.com"},
+                    {"id": "kai-agent", "url": "https://agent.keboola.com"},
                 ]
             },
+        )
+
+        client = await KaiClient.from_storage_api(
+            storage_api_token="test-token",
+            storage_api_url="https://connection.keboola.com",
+            service=KaiBackend.ASSISTANT,
+        )
+
+        assert client.base_url == "https://assistant.keboola.com"
+        assert client.backend == KaiBackend.ASSISTANT
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_raw_string_service(self, httpx_mock: HTTPXMock):
+        """A raw service-id string resolves and normalizes to the enum."""
+        httpx_mock.add_response(
+            url="https://connection.keboola.com/v2/storage",
+            json={"services": [{"id": "kai-agent", "url": "https://agent.keboola.com"}]},
+        )
+
+        client = await KaiClient.from_storage_api(
+            storage_api_token="test-token",
+            storage_api_url="https://connection.keboola.com",
+            service="kai-agent",
+        )
+
+        assert client.base_url == "https://agent.keboola.com"
+        assert client.backend == KaiBackend.AGENT
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_unknown_service_id_leaves_backend_none(self, httpx_mock: HTTPXMock):
+        """A service id with no matching KaiBackend member records backend=None."""
+        httpx_mock.add_response(
+            url="https://connection.keboola.com/v2/storage",
+            json={"services": [{"id": "kai-future", "url": "https://future.keboola.com"}]},
+        )
+
+        client = await KaiClient.from_storage_api(
+            storage_api_token="test-token",
+            storage_api_url="https://connection.keboola.com",
+            service="kai-future",
+        )
+
+        assert client.base_url == "https://future.keboola.com"
+        assert client.backend is None
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_service_not_found(self, httpx_mock: HTTPXMock):
+        """Error names the requested service and lists available ids."""
+        httpx_mock.add_response(
+            url="https://connection.keboola.com/v2/storage",
+            json={"services": [{"id": "kai-assistant", "url": "https://assistant.keboola.com"}]},
         )
 
         with pytest.raises(KaiError) as exc_info:
@@ -832,19 +919,16 @@ class TestFromStorageApi:
                 storage_api_url="https://connection.keboola.com",
             )
 
-        assert "kai-assistant service not found" in str(exc_info.value)
+        assert "kai-agent service not found" in str(exc_info.value)
+        assert "kai-assistant" in str(exc_info.value)
         assert exc_info.value.code == "discovery:service_not_found"
 
     @pytest.mark.asyncio
-    async def test_from_storage_api_no_url(self, httpx_mock: HTTPXMock):
-        """Test error when kai-assistant service has no URL."""
+    async def test_no_url(self, httpx_mock: HTTPXMock):
+        """Error when the discovered service has no URL."""
         httpx_mock.add_response(
             url="https://connection.keboola.com/v2/storage",
-            json={
-                "services": [
-                    {"id": "kai-assistant"},  # No URL
-                ]
-            },
+            json={"services": [{"id": "kai-agent"}]},  # no URL
         )
 
         with pytest.raises(KaiError) as exc_info:
@@ -857,8 +941,8 @@ class TestFromStorageApi:
         assert exc_info.value.code == "discovery:no_url"
 
     @pytest.mark.asyncio
-    async def test_from_storage_api_http_error(self, httpx_mock: HTTPXMock):
-        """Test error when Storage API returns HTTP error."""
+    async def test_http_error(self, httpx_mock: HTTPXMock):
+        """Error when Storage API returns HTTP error; message names the requested service."""
         httpx_mock.add_response(
             url="https://connection.keboola.com/v2/storage",
             status_code=401,
@@ -871,19 +955,36 @@ class TestFromStorageApi:
                 storage_api_url="https://connection.keboola.com",
             )
 
+        assert "kai-agent" in str(exc_info.value)
         assert "HTTP 401" in str(exc_info.value)
         assert exc_info.value.code == "discovery:http_error"
 
     @pytest.mark.asyncio
-    async def test_from_storage_api_custom_timeouts(self, httpx_mock: HTTPXMock):
-        """Test that custom timeouts are passed to the client."""
+    async def test_http_error_names_explicit_service(self, httpx_mock: HTTPXMock):
+        """HTTP error message names kai-assistant when explicitly requested."""
         httpx_mock.add_response(
             url="https://connection.keboola.com/v2/storage",
-            json={
-                "services": [
-                    {"id": "kai-assistant", "url": "https://kai.keboola.com"},
-                ]
-            },
+            status_code=401,
+            json={"message": "Unauthorized"},
+        )
+
+        with pytest.raises(KaiError) as exc_info:
+            await KaiClient.from_storage_api(
+                storage_api_token="bad-token",
+                storage_api_url="https://connection.keboola.com",
+                service=KaiBackend.ASSISTANT,
+            )
+
+        assert "kai-assistant" in str(exc_info.value)
+        assert "HTTP 401" in str(exc_info.value)
+        assert exc_info.value.code == "discovery:http_error"
+
+    @pytest.mark.asyncio
+    async def test_custom_timeouts(self, httpx_mock: HTTPXMock):
+        """Custom timeouts are passed to the client."""
+        httpx_mock.add_response(
+            url="https://connection.keboola.com/v2/storage",
+            json={"services": [{"id": "kai-agent", "url": "https://agent.keboola.com"}]},
         )
 
         client = await KaiClient.from_storage_api(
