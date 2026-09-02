@@ -583,6 +583,94 @@ class TestSendMessage:
         assert events[3].type == "finish"
 
 
+class TestSendMessageReconnect:
+    """Tests for send_message's automatic reconnect on a dropped/capped stream.
+
+    These patch client._stream_request and kai_client.client.parse_sse_stream
+    directly instead of driving pytest-httpx, since simulating a connection
+    that dies *mid*-stream (rather than never connecting at all) isn't
+    something the HTTP mock can express.
+    """
+
+    @pytest.mark.asyncio
+    async def test_reconnects_via_resume_endpoint_after_stream_drop(
+        self, client: KaiClient, monkeypatch
+    ):
+        """A mid-stream connection drop reconnects with a GET .../stream?messageId= call."""
+        from contextlib import asynccontextmanager
+
+        import httpx
+
+        from kai_client import client as client_module
+        from kai_client.models import FinishEvent, TextEvent
+
+        calls: list[tuple[str, str, dict | None]] = []
+
+        @asynccontextmanager
+        async def fake_stream_request(method, path, *, json=None, params=None):
+            calls.append((method, path, params))
+            yield type("FakeResponse", (), {"status_code": 200})()
+
+        async def fake_parse_sse_stream(response):
+            if len(calls) == 1:
+                yield TextEvent(type="text", text="hello ", state=None)
+                raise httpx.RemoteProtocolError("peer closed connection")
+            else:
+                yield TextEvent(type="text", text="world", state=None)
+                yield FinishEvent(type="finish", finishReason="stop", usage=None)
+
+        monkeypatch.setattr(client_module, "_RECONNECT_BACKOFF_SECONDS", 0)
+        monkeypatch.setattr(client_module, "parse_sse_stream", fake_parse_sse_stream)
+        monkeypatch.setattr(client, "_stream_request", fake_stream_request)
+
+        events = [event async for event in client.send_message("chat-1", "hi")]
+
+        assert "".join(e.text for e in events if e.type == "text") == "hello world"
+        assert events[-1].type == "finish"
+        assert len(calls) == 2
+        assert calls[0][0] == "POST" and calls[0][1] == "/api/chat"
+        assert calls[1][0] == "GET" and calls[1][1] == "/api/chat/chat-1/stream"
+        assert set(calls[1][2]) == {"messageId"}
+
+    @pytest.mark.asyncio
+    async def test_reconnects_when_stream_timeout_elapses_without_a_drop(
+        self, client: KaiClient, monkeypatch
+    ):
+        """Hitting the per-connection stream_timeout cap also reconnects, with no error."""
+        import asyncio
+        from contextlib import asynccontextmanager
+
+        from kai_client import client as client_module
+        from kai_client.models import FinishEvent, TextEvent
+
+        calls: list[tuple[str, str, dict | None]] = []
+
+        @asynccontextmanager
+        async def fake_stream_request(method, path, *, json=None, params=None):
+            calls.append((method, path, params))
+            yield type("FakeResponse", (), {"status_code": 200})()
+
+        async def fake_parse_sse_stream(response):
+            if len(calls) == 1:
+                await asyncio.sleep(1)  # longer than stream_timeout below
+                yield TextEvent(type="text", text="never", state=None)
+            else:
+                yield TextEvent(type="text", text="world", state=None)
+                yield FinishEvent(type="finish", finishReason="stop", usage=None)
+
+        client.stream_timeout = 0.05
+        monkeypatch.setattr(client_module, "parse_sse_stream", fake_parse_sse_stream)
+        monkeypatch.setattr(client, "_stream_request", fake_stream_request)
+
+        events = [event async for event in client.send_message("chat-1", "hi")]
+
+        assert [e.text for e in events if e.type == "text"] == ["world"]
+        assert events[-1].type == "finish"
+        assert len(calls) == 2
+        assert calls[0][0] == "POST"
+        assert calls[1][0] == "GET" and calls[1][1] == "/api/chat/chat-1/stream"
+
+
 class TestChat:
     """Tests for the convenience chat method."""
 

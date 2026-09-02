@@ -278,6 +278,25 @@ async with KaiClient(
     print()
 ```
 
+### Streaming Reliability
+
+`send_message` never depends on a single HTTP request staying open for the
+whole reply. Each connection is capped at `stream_timeout` seconds (default
+240 = 4 minutes) — handy behind a data app's proxy, which often kills
+long-lived connections regardless of activity. If a connection hits that cap,
+times out, or drops, `send_message` transparently reconnects (first retrying
+the POST if the server never even accepted the message, otherwise polling
+`GET /api/chat/{chat_id}/stream` to resume the same in-progress generation)
+and keeps yielding events until a `finish`/`error` event actually arrives.
+Real 4xx/5xx errors still raise immediately — only timeouts and dropped
+connections are retried. Nothing changes in how you consume it:
+
+```python
+async for event in client.send_message(chat_id, "Long-running task..."):
+    if event.type == "text":
+        print(event.text, end="")
+```
+
 ### Handling Tool Calls
 
 ```python
@@ -452,7 +471,7 @@ client = await KaiClient.from_storage_api(
     storage_api_url: str,          # Keboola connection URL (e.g., https://connection.keboola.com)
     service: KaiBackend = KaiBackend.AGENT,  # Backend to discover (keyword-only)
     timeout: float = 300.0,        # Request timeout in seconds
-    stream_timeout: float = 600.0,  # Streaming timeout in seconds
+    stream_timeout: float = 240.0,  # Per-connection cap; send_message reconnects past this
     workspace_id: str | None = None,  # Pin queries to this workspace (e.g. a Data App's WORKSPACE_ID)
 )
 ```
@@ -490,7 +509,7 @@ KaiClient(
     storage_api_url: str,        # Keboola connection URL
     base_url: str = "http://localhost:3000",  # Kai API base URL
     timeout: float = 300.0,      # Request timeout in seconds
-    stream_timeout: float = 600.0,  # Streaming timeout in seconds
+    stream_timeout: float = 240.0,  # Per-connection cap; send_message reconnects past this
     backend: KaiBackend | None = None,  # Which backend base_url points at, if known
     workspace_id: str | None = None,  # Pin queries to this workspace (e.g. a Data App's WORKSPACE_ID)
 )

@@ -1,5 +1,6 @@
 """Main Kai client implementation."""
 
+import asyncio
 import uuid
 from contextlib import asynccontextmanager
 from json import JSONDecodeError
@@ -11,6 +12,7 @@ import httpx
 from kai_client.exceptions import (
     KaiConnectionError,
     KaiError,
+    KaiStreamError,
     KaiTimeoutError,
     raise_for_error_response,
 )
@@ -20,6 +22,8 @@ from kai_client.models import (
     Chat,
     ChatDetail,
     ChatRequest,
+    ErrorEvent,
+    FinishEvent,
     HistoryResponse,
     InfoResponse,
     MessageMetadata,
@@ -42,6 +46,10 @@ from kai_client.types import KaiBackend, VisibilityType, VoteType
 
 # Sentinel for "caller did not pass this argument" — distinct from None (explicit clear).
 _UNSET: Any = object()
+
+# Delay before retrying after a hard connection failure (timeout/dropped socket),
+# so a reconnect loop backs off instead of hammering an unreachable server.
+_RECONNECT_BACKOFF_SECONDS = 2.0
 
 
 def _normalize_visibility(visibility: str | VisibilityType) -> str:
@@ -91,7 +99,7 @@ class KaiClient:
         *,
         service: KaiBackend | str = KaiBackend.AGENT,
         timeout: float = 300.0,
-        stream_timeout: float = 600.0,
+        stream_timeout: float = 240.0,
         workspace_id: Optional[str] = None,
     ) -> "KaiClient":
         """
@@ -107,7 +115,11 @@ class KaiClient:
                 (the modern agent backend). Pass KaiBackend.ASSISTANT for the
                 legacy backend, or a raw service-id string.
             timeout: Default timeout for non-streaming requests in seconds.
-            stream_timeout: Timeout for streaming requests in seconds.
+            stream_timeout: Max seconds a single streaming connection may stay open
+                before ``send_message`` transparently reconnects (default: 4 minutes).
+                Data apps often sit behind a proxy that kills long-lived connections
+                regardless of activity, so the stream never relies on one request
+                staying up for the whole response — see ``send_message``.
             workspace_id: Optional Keboola workspace ID to pin Kai's queries to — e.g. a
                 Data App's own `WORKSPACE_ID` env var, so Kai queries that workspace
                 instead of the default per-branch one.
@@ -189,7 +201,7 @@ class KaiClient:
         storage_api_url: str,
         base_url: str = "http://localhost:3000",
         timeout: float = 300.0,
-        stream_timeout: float = 600.0,
+        stream_timeout: float = 240.0,
         backend: KaiBackend | None = None,
         workspace_id: Optional[str] = None,
     ) -> None:
@@ -201,7 +213,8 @@ class KaiClient:
             storage_api_url: Keboola Storage API URL (e.g., https://connection.keboola.com).
             base_url: Base URL for the Kai API (default: http://localhost:3000).
             timeout: Default timeout for non-streaming requests in seconds.
-            stream_timeout: Timeout for streaming requests in seconds.
+            stream_timeout: Max seconds a single streaming connection may stay open
+                before ``send_message`` transparently reconnects (default: 4 minutes).
             backend: The resolved KaiBackend this client targets, or None when
                 constructed directly (backend behind base_url is unknown).
             workspace_id: Optional Keboola workspace ID to pin Kai's queries to — e.g. a
@@ -432,6 +445,69 @@ class KaiClient:
                 )
             yield response
 
+    async def _stream_chat(
+        self,
+        chat_id: str,
+        message_id: str,
+        payload: dict[str, Any],
+    ) -> AsyncIterator[SSEEvent]:
+        """
+        Stream a chat response, reconnecting automatically until it's actually done.
+
+        No single HTTP request is trusted to carry the whole response: each
+        connection is capped at ``self.stream_timeout`` seconds (default 4
+        minutes), and every drop — the cap, a dead socket, a proxy-killed
+        connection — reopens a fresh request rather than raising. The first
+        request is the ``POST /api/chat`` that creates the message; once that
+        has been accepted by the server, every reconnect after it instead
+        polls ``GET /api/chat/{chat_id}/stream?messageId=...`` to pick the
+        same in-progress generation back up (retrying the POST again would
+        resend a duplicate user message). A hard 4xx/5xx from either endpoint
+        still raises immediately — only timeouts and connection drops loop.
+
+        Args:
+            chat_id: The chat session ID.
+            message_id: The id of the user message that started this response.
+            payload: The JSON body for the initial POST /api/chat request.
+
+        Yields:
+            SSE events from the (possibly many, reconnected) response stream.
+        """
+        method, path, kwargs = "POST", "/api/chat", {"json": payload}
+        accepted = False  # True once the server has accepted the message
+
+        while True:
+            clean_timeout = False
+            try:
+                async with self._stream_request(method, path, **kwargs) as response:
+                    accepted = True
+                    if response.status_code == 204:
+                        return  # nothing (left) to stream
+
+                    loop = asyncio.get_running_loop()
+                    deadline = loop.time() + self.stream_timeout
+                    stream = parse_sse_stream(response).__aiter__()
+                    while True:
+                        try:
+                            event = await asyncio.wait_for(
+                                stream.__anext__(), timeout=max(deadline - loop.time(), 0)
+                            )
+                        except StopAsyncIteration:
+                            return
+                        yield event
+                        if isinstance(event, (FinishEvent, ErrorEvent)):
+                            return
+            except asyncio.TimeoutError:
+                clean_timeout = True
+            except (httpx.TransportError, KaiStreamError):
+                pass
+
+            if accepted:
+                method, path = "GET", f"/api/chat/{chat_id}/stream"
+                kwargs = {"params": {"messageId": message_id}}
+            if not clean_timeout:
+                await asyncio.sleep(_RECONNECT_BACKOFF_SECONDS)
+
     async def send_message(
         self,
         chat_id: str,
@@ -446,7 +522,9 @@ class KaiClient:
         Send a message and stream the response.
 
         This method sends a user message to an existing or new chat and yields
-        SSE events as they arrive from the server.
+        SSE events as they arrive from the server. The underlying connection
+        is automatically reconnected (via ``_stream_chat``) if it times out or
+        drops before a ``finish``/``error`` event arrives — see ``stream_timeout``.
 
         Args:
             chat_id: The chat session ID (use new_chat_id() to create one).
@@ -457,7 +535,8 @@ class KaiClient:
             request_path: Optional path context for the request.
 
         Yields:
-            SSE events from the response stream.
+            SSE events from the response stream, across as many reconnects as
+            it takes to reach a terminal ``finish`` or ``error`` event.
 
         Example:
             ```python
@@ -476,10 +555,11 @@ class KaiClient:
             )
 
         # Build the request
+        message_id = self.new_message_id()
         request = ChatRequest(
             id=chat_id,
             message=MessageRequest(
-                id=self.new_message_id(),
+                id=message_id,
                 role="user",
                 parts=[TextPart(type="text", text=text)],
                 metadata=metadata,
@@ -492,9 +572,8 @@ class KaiClient:
         # Serialize with aliases
         payload = request.model_dump(by_alias=True, exclude_none=True)
 
-        async with self._stream_request("POST", "/api/chat", json=payload) as response:
-            async for event in parse_sse_stream(response):
-                yield event
+        async for event in self._stream_chat(chat_id, message_id, payload):
+            yield event
 
     async def send_tool_approval_response(
         self,
