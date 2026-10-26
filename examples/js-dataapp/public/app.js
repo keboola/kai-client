@@ -2,10 +2,10 @@
  * Kai Data App - Frontend
  *
  * Pure vanilla JS chat client that:
- * - Sends messages to the Express backend (which proxies to kai-assistant)
+ * - Sends messages to the Express backend (which proxies to kai-agent)
  * - Parses SSE streams for text, tool calls, tool approvals, and errors
  * - Renders markdown-ish text with code blocks
- * - Handles tool approval flow
+ * - Handles tool approval flow (the chat stream stays open while a tool waits)
  * - Extracts and renders suggestion buttons
  */
 
@@ -18,10 +18,14 @@ const approvalBar = document.getElementById("approval-bar");
 const approveBtn = document.getElementById("approve-btn");
 const denyBtn = document.getElementById("deny-btn");
 const suggestionsEl = document.getElementById("suggestions");
+const approvalTextEl = document.getElementById("approval-text");
 
 let chatId = crypto.randomUUID();
-let pendingApproval = null;
+// Tools waiting for a decision, oldest first: { chatId, toolCallId, toolName }
+let pendingApprovals = [];
 let isStreaming = false;
+let kaiUnavailable = false;
+let streamAbort = null;
 
 // ── Helpers ──
 
@@ -31,8 +35,34 @@ function scrollToBottom() {
 
 function setStreaming(val) {
   isStreaming = val;
-  sendBtn.disabled = val;
-  chatInput.disabled = val;
+  sendBtn.disabled = val || kaiUnavailable;
+  chatInput.disabled = val || kaiUnavailable;
+}
+
+function showNextApproval() {
+  const next = pendingApprovals[0];
+  if (!next) {
+    approvalBar.classList.add("hidden");
+    return;
+  }
+  approvalTextEl.textContent = `Kai wants to run ${next.toolName}. Approve it?`;
+  approveBtn.disabled = false;
+  denyBtn.disabled = false;
+  approvalBar.classList.remove("hidden");
+}
+
+function clearApprovals() {
+  pendingApprovals = [];
+  showNextApproval();
+}
+
+/**
+ * Remove a tool's card once its outcome arrives, e.g. after kai-agent denied it on timeout.
+ */
+function dropApproval(toolCallId) {
+  const wasFirst = pendingApprovals[0] && pendingApprovals[0].toolCallId === toolCallId;
+  pendingApprovals = pendingApprovals.filter((a) => a.toolCallId !== toolCallId);
+  if (wasFirst) showNextApproval();
 }
 
 /**
@@ -177,8 +207,7 @@ async function readSSEStream(url, fetchOptions, onEvent) {
   const res = await fetch(url, fetchOptions);
 
   if (!res.ok) {
-    const err = await res.text();
-    addError(`Error: ${err}`);
+    addError(`Error: ${await readErrorMessage(res)}`);
     return null;
   }
 
@@ -220,16 +249,10 @@ async function sendMessage(text) {
   let accumulated = "";
   const toolNames = {};
 
-  const payload = {
-    id: chatId,
-    message: {
-      id: crypto.randomUUID(),
-      role: "user",
-      parts: [{ type: "text", text }],
-    },
-    selectedChatModel: "chat-model",
-    selectedVisibilityType: "private",
-  };
+  const turnChatId = chatId;
+  streamAbort = new AbortController();
+  let finished = false;
+  const payload = { id: turnChatId, text };
 
   try {
     const res = await readSSEStream(
@@ -238,6 +261,7 @@ async function sendMessage(text) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
+        signal: streamAbort.signal,
       },
       ({ type, data }) => {
         switch (type) {
@@ -249,37 +273,51 @@ async function sendMessage(text) {
             }
             break;
 
-          case "tool-call": {
-            const callId = data.toolCallId || "";
-            const name = data.toolName || null;
-            const state = data.state || "";
+          case "tool-input-start":
+            toolNames[data.toolCallId] = data.toolName;
+            break;
 
-            if (name) toolNames[callId] = name;
-            const displayName = name || toolNames[callId] || "tool";
-
-            if (state === "input-available") {
-              content.innerHTML = renderMarkdown(accumulated);
-              addToolIndicator(container, `Calling ${displayName}...`);
-            } else if (state === "output-available") {
-              addToolIndicator(container, `${displayName} completed.`, true);
-            }
+          case "tool-input-available": {
+            const name = data.toolName || toolNames[data.toolCallId] || "tool";
+            toolNames[data.toolCallId] = name;
+            content.innerHTML = renderMarkdown(accumulated);
+            addToolIndicator(container, `Calling ${name}...`);
             break;
           }
 
+          case "tool-output-available":
+            dropApproval(data.toolCallId);
+            addToolIndicator(container, `${toolNames[data.toolCallId] || "tool"} completed.`, true);
+            break;
+
+          case "tool-output-error":
+            dropApproval(data.toolCallId);
+            addToolIndicator(container, `${toolNames[data.toolCallId] || "tool"} failed: ${data.errorText}`);
+            break;
+
           case "tool-approval-request":
-            pendingApproval = {
-              approvalId: data.approvalId,
+            pendingApprovals.push({
+              chatId: turnChatId,
               toolCallId: data.toolCallId,
-            };
-            approvalBar.classList.remove("hidden");
+              toolName: toolNames[data.toolCallId] || "a tool",
+            });
+            if (pendingApprovals.length === 1) showNextApproval();
             break;
 
           case "error":
-            addError(data.message || "Unknown error");
+            addError(data.errorText || "Kai could not finish this answer.");
+            break;
+
+          case "finish":
+            finished = true;
             break;
         }
       }
     );
+
+    if (res && !finished) {
+      addError("The connection to Kai was lost. The answer may still be running; start a new chat to stop it.");
+    }
 
     if (!res) {
       container.remove();
@@ -290,71 +328,74 @@ async function sendMessage(text) {
         content.innerHTML = renderMarkdown(body);
         renderSuggestions(suggestions);
       }
-    } else {
+    } else if (!container.querySelector(".tool-indicator")) {
       container.remove();
     }
   } catch (err) {
     container.remove();
-    addError(`Connection error: ${err.message}`);
+    if (err.name !== "AbortError") addError(`Connection error: ${err.message}`);
   }
 
+  // The turn is over, so any decision still pending can no longer apply.
+  if (chatId === turnChatId) clearApprovals();
   setStreaming(false);
   chatInput.focus();
 }
 
+/**
+ * Send the decision for the oldest waiting tool. The chat stream from sendMessage is
+ * still open and carries the outcome; this request returns only an acknowledgement.
+ */
 async function handleApproval(approved) {
-  if (!pendingApproval) return;
+  const approval = pendingApprovals[0];
+  if (!approval) return;
 
-  approvalBar.classList.add("hidden");
-  const { approvalId } = pendingApproval;
-  pendingApproval = null;
-
-  setStreaming(true);
-  const { container, content } = createAssistantMessage();
-  let accumulated = "";
-  const toolNames = {};
-
-  const action = approved ? "approve" : "reject";
-  const endpoint = `/api/chat/${chatId}/${action}/${approvalId}`;
+  approveBtn.disabled = true;
+  denyBtn.disabled = true;
 
   try {
-    const res = await readSSEStream(
-      endpoint,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-      },
-      ({ type, data }) => {
-        if (type === "text-delta" && data && data.delta) {
-          accumulated += data.delta;
-          content.innerHTML = renderMarkdown(accumulated) + '<span class="cursor"></span>';
-          scrollToBottom();
-        } else if (type === "tool-call") {
-          const callId = data.toolCallId || "";
-          const name = data.toolName || null;
-          const state = data.state || "";
-          if (name) toolNames[callId] = name;
-          const displayName = name || toolNames[callId] || "tool";
-          if (state === "input-available") {
-            content.innerHTML = renderMarkdown(accumulated);
-            addToolIndicator(container, `Calling ${displayName}...`);
-          } else if (state === "output-available") {
-            addToolIndicator(container, `${displayName} completed.`, true);
-          }
-        } else if (type === "error") {
-          addError(data.message || "Unknown error");
-        }
-      }
-    );
+    const res = await fetch(`/api/chat/${approval.chatId}/approval`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        toolUseId: approval.toolCallId,
+        approved,
+        ...(approved ? {} : { reason: "User denied" }),
+      }),
+    });
 
-    if (res) {
-      content.innerHTML = renderMarkdown(accumulated);
+    if (res.ok || res.status === 409) {
+      // 409: already resolved, timed out or the chat was stopped; retrying cannot help.
+      if (res.status === 409 && approval.chatId === chatId) addError(await readErrorMessage(res));
+      dropApproval(approval.toolCallId);
+      return;
     }
+    if (!pendingApprovals.includes(approval)) return;
+    addError(`Approval failed: ${await readErrorMessage(res)}`);
   } catch (err) {
     addError(`Connection error: ${err.message}`);
   }
+  // Leave the card up so the user can try again.
+  approveBtn.disabled = false;
+  denyBtn.disabled = false;
+}
 
-  setStreaming(false);
+/**
+ * The human-readable message of an error response from the backend or kai-agent.
+ */
+async function readErrorMessage(res) {
+  const text = await res.text();
+  try {
+    const { error } = JSON.parse(text);
+    try {
+      const upstream = JSON.parse(error);
+      return (upstream.error && upstream.error.message) || upstream.message || error;
+    } catch {
+      return error;
+    }
+  } catch {
+    return text || `${res.status} ${res.statusText}`;
+  }
 }
 
 // ── Event listeners ──
@@ -369,26 +410,33 @@ chatForm.addEventListener("submit", (e) => {
 });
 
 newChatBtn.addEventListener("click", () => {
+  if (isStreaming) {
+    // Closing the stream does not stop the turn on kai-agent.
+    fetch(`/api/chat/${chatId}/stop`, { method: "POST" }).catch((err) =>
+      console.error("Stop failed:", err)
+    );
+  }
+  if (streamAbort) streamAbort.abort();
   chatId = crypto.randomUUID();
   messagesEl.innerHTML = "";
   suggestionsEl.innerHTML = "";
-  approvalBar.classList.add("hidden");
-  pendingApproval = null;
+  clearApprovals();
   chatInput.focus();
 });
 
 approveBtn.addEventListener("click", () => handleApproval(true));
 denyBtn.addEventListener("click", () => handleApproval(false));
 
-// Check credentials on load
+// Check whether Kai can be used in this run on load
 fetch("/api/config")
   .then((r) => r.json())
   .then((config) => {
-    if (!config.hasCredentials) {
-      addError(
-        "Missing credentials. Set STORAGE_API_TOKEN and STORAGE_API_URL in .env.local (local) or as environment variables (Keboola)."
-      );
+    if (config.kaiError) {
+      kaiUnavailable = true;
+      setStreaming(isStreaming);
+      addError(config.kaiError);
     }
-  });
+  })
+  .catch((err) => addError(`Could not load the app configuration: ${err.message}`));
 
 chatInput.focus();

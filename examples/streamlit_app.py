@@ -10,6 +10,19 @@ Requires:
 Credentials are loaded from a .env.local file in the project root:
     STORAGE_API_TOKEN=your-keboola-token
     STORAGE_API_URL=https://connection.keboola.com
+
+In a Keboola Data App deployed with Kai, KAI_STORAGE_API_TOKEN, KAI_ENABLED, KBC_URL
+and WORKSPACE_ID are injected for you; resolve_storage_api_token() prefers the Kai token.
+
+Tool approvals are not supported in this example:
+  - kai-agent keeps the chat stream open while a write tool waits for a decision, and
+    the decision must be posted with submit_approval() while that stream is still open.
+  - Streamlit reruns the script on every button click, which ends the stream, and
+    kai-client does not request the event that says which tool is waiting.
+  - A write tool therefore waits until kai-agent denies it (after 5 minutes). Deploy the
+    app with a direct-grant input mapping (strict mode), where Kai has no write tools.
+  - Questions to the user (AskUserQuestion) and plan cards (ExitPlanMode) would wait
+    forever, so the app declines them as soon as they appear.
 """
 
 import asyncio
@@ -20,7 +33,7 @@ from pathlib import Path
 import streamlit as st
 from dotenv import load_dotenv
 
-from kai_client import KaiBackend, KaiClient
+from kai_client import KaiClient, KaiConfigurationError, KaiError, resolve_storage_api_token
 
 # Load credentials from .env.local (same as the kai CLI)
 _env_local = Path(__file__).resolve().parent.parent / ".env.local"
@@ -30,11 +43,23 @@ if _env_local.exists():
 st.set_page_config(page_title="Kai Chat", page_icon="🤖", layout="wide")
 st.title("Kai Chat")
 
-token = os.environ.get("STORAGE_API_TOKEN", "")
-api_url = os.environ.get("STORAGE_API_URL", "")
+# KAI_STORAGE_API_TOKEN first, then STORAGE_API_TOKEN; never KBC_TOKEN, which kai-agent refuses.
+try:
+    token = resolve_storage_api_token() or ""
+except KaiConfigurationError as e:
+    st.error(f"Kai is not available in this run of the app. {e.message}")
+    st.stop()
+api_url = os.environ.get("STORAGE_API_URL") or os.environ.get("KBC_URL", "")
 # Injected automatically into every Data App container by Keboola — pins Kai's queries to
-# this app's own workspace instead of the default per-branch one. Unset outside a Data App.
+# this app's own workspace. Required with the Kai token; unset outside a Data App.
 workspace_id = os.environ.get("WORKSPACE_ID") or None
+
+if os.environ.get("KAI_STORAGE_API_TOKEN") and not workspace_id:
+    st.error(
+        "Kai is not available: KAI_STORAGE_API_TOKEN needs WORKSPACE_ID. "
+        "Enable the app's workspace and redeploy it."
+    )
+    st.stop()
 
 if not token or not api_url:
     st.error(
@@ -48,8 +73,6 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "chat_id" not in st.session_state:
     st.session_state.chat_id = KaiClient.new_chat_id()
-if "pending_approval" not in st.session_state:
-    st.session_state.pending_approval = None
 if "suggestions" not in st.session_state:
     st.session_state.suggestions = []
 
@@ -58,9 +81,16 @@ with st.sidebar:
     if st.button("New Chat"):
         st.session_state.messages = []
         st.session_state.chat_id = KaiClient.new_chat_id()
-        st.session_state.pending_approval = None
         st.rerun()
     st.caption(f"Chat ID: `{st.session_state.chat_id[:8]}...`")
+    st.caption(
+        "Write actions need an approval this example cannot collect; "
+        "they are denied after 5 minutes."
+    )
+
+
+# Tools that wait for the user with no timeout; this app cannot show them.
+INTERACTIVE_TOOLS = ("AskUserQuestion", "ExitPlanMode")
 
 
 # --- Helpers ---
@@ -106,25 +136,17 @@ def run_async(coro):
 
 
 async def get_client() -> KaiClient:
-    """Create a KaiClient with auto-discovered URL.
-
-    Pinned to the legacy kai-assistant backend because the approval handling
-    below uses approve_tool / reject_tool, which kai-agent does not support.
-    Streamlit's rerun model cannot hold the send_message stream open across the
-    approve/deny button click, which is what kai-agent's submit_approval needs.
-    """
+    """Create a KaiClient for the auto-discovered kai-agent backend."""
     return await KaiClient.from_storage_api(
         storage_api_token=token,
         storage_api_url=api_url,
-        service=KaiBackend.ASSISTANT,
         workspace_id=workspace_id,
     )
 
 
 async def collect_chat_response(chat_id, text, container):
-    """Stream a chat response into a container. Returns (full_text, pending_approval)."""
+    """Stream a chat response into a container. Returns the full text."""
     accumulated = ""
-    pending = None
     tool_names: dict[str, str] = {}  # tool_call_id -> tool_name
     text_placeholder = container.empty()
     client = await get_client()
@@ -141,7 +163,18 @@ async def collect_chat_response(chat_id, text, container):
                 if name:
                     tool_names[call_id] = name
                 display_name = name or tool_names.get(call_id, "tool")
-                if state == "input-available":
+                if state == "input-available" and any(t in display_name for t in INTERACTIVE_TOOLS):
+                    try:
+                        await client.submit_approval(
+                            chat_id=chat_id,
+                            tool_use_id=call_id,
+                            approved=False,
+                            reason="This app cannot show questions or plans to the user. "
+                            "Continue without asking.",
+                        )
+                    except KaiError as e:
+                        container.warning(f"Could not decline **{display_name}**: {e.message}")
+                elif state == "input-available":
                     # Finalize current text, show tool status, start new text placeholder
                     text_placeholder.markdown(accumulated)
                     container.info(f"Calling **{display_name}**...")
@@ -150,45 +183,15 @@ async def collect_chat_response(chat_id, text, container):
                     text_placeholder.markdown(accumulated)
                     container.info(f"**{display_name}** completed.")
                     text_placeholder = container.empty()
-            elif event.type == "tool-approval-request":
-                pending = {
-                    "approval_id": event.approval_id,
-                    "tool_call_id": event.tool_call_id,
-                }
+            elif event.type == "tool-output-error":
+                display_name = tool_names.get(event.tool_call_id, "tool")
+                text_placeholder.markdown(accumulated)
+                container.warning(f"**{display_name}** failed: {event.error_text}")
+                text_placeholder = container.empty()
             elif event.type == "error":
-                container.error(getattr(event, "message", "Unknown error"))
+                container.error(f"Kai could not finish this answer: {event.message}")
 
     text_placeholder.markdown(accumulated)
-    return accumulated, pending
-
-
-async def collect_approval_response(chat_id, approval_id, approved, placeholder=None):
-    """Handle tool approval and stream the continuation. Returns the full text."""
-    accumulated = ""
-    client = await get_client()
-
-    async with client:
-        if approved:
-            stream = client.approve_tool(chat_id=chat_id, approval_id=approval_id)
-        else:
-            stream = client.reject_tool(
-                chat_id=chat_id, approval_id=approval_id, reason="User denied"
-            )
-
-        async for event in stream:
-            if event.type == "text":
-                accumulated += event.text
-                if placeholder:
-                    placeholder.markdown(accumulated + "▌")
-            elif event.type == "tool-call":
-                tool_name = getattr(event, "tool_name", None) or "unknown"
-                if getattr(event, "state", None) == "output-available":
-                    st.info(f"**{tool_name}** completed.")
-            elif event.type == "error":
-                st.error(getattr(event, "message", "Unknown error"))
-
-    if placeholder:
-        placeholder.markdown(accumulated)
     return accumulated
 
 
@@ -198,7 +201,7 @@ for msg in st.session_state.messages:
         st.markdown(msg["content"])
 
 # --- Render suggestion buttons (only for the latest response) ---
-if st.session_state.suggestions and not st.session_state.pending_approval:
+if st.session_state.suggestions:
     cols = st.columns(len(st.session_state.suggestions))
     for i, suggestion in enumerate(st.session_state.suggestions):
         with cols[i]:
@@ -206,42 +209,6 @@ if st.session_state.suggestions and not st.session_state.pending_approval:
                 st.session_state.suggestions = []
                 st.session_state._pending_prompt = suggestion
                 st.rerun()
-
-# --- Handle pending tool approval ---
-if st.session_state.pending_approval:
-    approval = st.session_state.pending_approval
-    st.warning("A tool requires your approval before it can execute.")
-    col1, col2 = st.columns(2)
-
-    with col1:
-        if st.button("Approve", type="primary", use_container_width=True):
-            st.session_state.pending_approval = None
-            with st.chat_message("assistant"):
-                placeholder = st.empty()
-                result = run_async(
-                    collect_approval_response(
-                        st.session_state.chat_id,
-                        approval["approval_id"],
-                        True,
-                        placeholder=placeholder,
-                    )
-                )
-            st.session_state.messages.append({"role": "assistant", "content": result})
-            st.rerun()
-
-    with col2:
-        if st.button("Deny", use_container_width=True):
-            st.session_state.pending_approval = None
-            result = run_async(
-                collect_approval_response(
-                    st.session_state.chat_id,
-                    approval["approval_id"],
-                    False,
-                )
-            )
-            if result:
-                st.session_state.messages.append({"role": "assistant", "content": result})
-            st.rerun()
 
 # --- Chat input ---
 # Accept input from chat box or from a suggestion button click
@@ -259,16 +226,11 @@ if prompt:
 
     with st.chat_message("assistant"):
         container = st.container()
-        result_text, pending = run_async(
-            collect_chat_response(st.session_state.chat_id, prompt, container)
-        )
+        result_text = run_async(collect_chat_response(st.session_state.chat_id, prompt, container))
 
     # Extract suggestions from the response
     body, suggestions = extract_suggestions(result_text)
     st.session_state.messages.append({"role": "assistant", "content": body})
     st.session_state.suggestions = suggestions
-
-    if pending:
-        st.session_state.pending_approval = pending
 
     st.rerun()
