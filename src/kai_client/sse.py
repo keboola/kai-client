@@ -122,10 +122,10 @@ def _parse_finish_event(data: dict[str, Any]) -> FinishEvent:
 
 
 def _parse_error_event(data: dict[str, Any]) -> ErrorEvent:
-    """Parse an error event."""
+    """Parse an error event (kai-agent: `errorText`, older backends: `message`)."""
     return ErrorEvent(
         type="error",
-        message=data.get("message", "Unknown error"),
+        message=data.get("errorText") or data.get("message") or "Unknown error",
         code=data.get("code"),
     )
 
