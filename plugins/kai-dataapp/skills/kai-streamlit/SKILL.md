@@ -37,7 +37,13 @@ STORAGE_API_URL=https://connection.keboola.com
 
 Show a clear error if credentials are missing:
 ```python
-token = os.environ.get("STORAGE_API_TOKEN", "")
+from kai_client import KaiConfigurationError, resolve_storage_api_token
+
+try:
+    token = resolve_storage_api_token() or ""
+except KaiConfigurationError as e:
+    st.error(e.message)
+    st.stop()
 api_url = os.environ.get("STORAGE_API_URL", "")
 workspace_id = os.environ.get("WORKSPACE_ID") or None
 
@@ -45,6 +51,14 @@ if not token or not api_url:
     st.error("Missing credentials. Create a `.env.local` file...")
     st.stop()
 ```
+
+> **`KAI_STORAGE_API_TOKEN`** is injected (together with `KAI_ENABLED`) into Data Apps deployed
+> with Kai enabled — a dedicated Kai token that kai-agent scopes to the app's own workspace.
+> `resolve_storage_api_token()` prefers it over `STORAGE_API_TOKEN`. With `KAI_ENABLED` set and
+> no Kai token it raises `KaiConfigurationError` instead of falling back to the user's token —
+> the app must be redeployed by a user who is allowed to create Storage API tokens. Only
+> kai-agent scopes the Kai token, so a Kai-enabled app must keep the default backend (no
+> `service=KaiBackend.ASSISTANT`). Never set either variable in `.env.local`.
 
 > **`WORKSPACE_ID`** is injected automatically into every Data App container by Keboola — never
 > set it in `.env.local`. Pass it to `KaiClient`/`from_storage_api()` as `workspace_id` (see

@@ -15,7 +15,14 @@ _env_local = Path.cwd() / ".env.local"
 if _env_local.exists():
     load_dotenv(_env_local)
 
-from kai_client import KaiBackend, KaiClient, KaiNotFoundError, __version__  # noqa: E402
+from kai_client import (  # noqa: E402
+    KaiBackend,
+    KaiClient,
+    KaiConfigurationError,
+    KaiNotFoundError,
+    __version__,
+    resolve_storage_api_token,
+)
 from kai_client.models import ToolApprovalRequestEvent  # noqa: E402
 from kai_client.types import VoteType  # noqa: E402
 
@@ -39,8 +46,7 @@ def run_async(coro):
 @click.version_option(version=__version__, prog_name="kai")
 @click.option(
     "--token",
-    envvar="STORAGE_API_TOKEN",
-    help="Keboola Storage API token (or set STORAGE_API_TOKEN env var)",
+    help="Keboola Storage API token (or set KAI_STORAGE_API_TOKEN / STORAGE_API_TOKEN env var)",
 )
 @click.option(
     "--url",
@@ -82,7 +88,8 @@ def main(
     Kai CLI - Command-line interface for the Keboola AI Assistant.
 
     Requires STORAGE_API_TOKEN and STORAGE_API_URL environment variables,
-    or use --token and --url options.
+    or use --token and --url options. KAI_STORAGE_API_TOKEN, when set, takes
+    precedence over STORAGE_API_TOKEN.
 
     Examples:
 
@@ -111,7 +118,12 @@ def main(
 
 async def get_client(ctx) -> KaiClient:
     """Create and return a KaiClient from context."""
-    token = ctx.obj.get("token") or get_env_or_error("STORAGE_API_TOKEN")
+    try:
+        token = resolve_storage_api_token(ctx.obj.get("token"))
+    except KaiConfigurationError as e:
+        click.echo(f"Error: {e.message}", err=True)
+        sys.exit(1)
+    token = token or get_env_or_error("STORAGE_API_TOKEN")
     url = ctx.obj.get("url") or get_env_or_error("STORAGE_API_URL")
     base_url = ctx.obj.get("base_url")
     workspace_id = ctx.obj.get("workspace_id")

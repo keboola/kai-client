@@ -117,6 +117,9 @@ STORAGE_API_TOKEN=your-keboola-token
 STORAGE_API_URL=https://connection.keboola.com
 ```
 
+When `KAI_STORAGE_API_TOKEN` is set, the CLI uses it instead of `STORAGE_API_TOKEN`; an
+explicit `--token` still wins. See [Storage API Token in Data Apps](#storage-api-token-in-data-apps).
+
 ### Commands
 
 #### Health & Info
@@ -461,6 +464,42 @@ This method auto-discovers the **kai-agent** service URL from your Keboola stack
 (the modern agent backend). To target the legacy `kai-assistant` backend
 (single-tenant deployments only), pass `service=KaiBackend.ASSISTANT`.
 
+#### Storage API Token in Data Apps
+
+A Data App deployed with Kai enabled gets a dedicated Kai token in the
+`KAI_STORAGE_API_TOKEN` env var (together with `KAI_ENABLED`). kai-agent scopes that
+token to the app's own workspace, so pass it together with `WORKSPACE_ID`. Only kai-agent
+does this scoping — do not combine the Kai token with `service=KaiBackend.ASSISTANT`.
+`resolve_storage_api_token()` picks the right token from the environment:
+
+```python
+import os
+
+from kai_client import KaiClient, resolve_storage_api_token
+
+token = resolve_storage_api_token()  # may raise KaiConfigurationError, see below
+if not token:
+    raise RuntimeError("Set STORAGE_API_TOKEN")
+
+client = await KaiClient.from_storage_api(
+    storage_api_token=token,
+    storage_api_url=os.environ["STORAGE_API_URL"],
+    workspace_id=os.environ.get("WORKSPACE_ID") or None,
+)
+```
+
+The token is resolved in this order:
+
+1. A token passed explicitly, e.g. `resolve_storage_api_token(my_token)`.
+2. `KAI_STORAGE_API_TOKEN`.
+3. `STORAGE_API_TOKEN` — only when `KAI_ENABLED` is not set. With `KAI_ENABLED` set and
+   no Kai token, it raises `KaiConfigurationError` instead of falling back to the user's
+   token: redeploy the app as a user who is allowed to create Storage API tokens.
+
+It returns `None` when no token is available. The `kai` CLI resolves its token the same way.
+The Kai token expires after 90 days; an expired or revoked one makes kai-agent reject requests
+with an authentication error, and the remedy is the same redeploy.
+
 #### Backend Support
 
 `kai-client` targets the **kai-agent** backend by default. The following methods
@@ -558,6 +597,7 @@ The `tool-call` event has these states: `started`, `input-available` (waiting fo
 | `KaiStreamError` | - | SSE stream error |
 | `KaiConnectionError` | - | Connection failed |
 | `KaiTimeoutError` | - | Request timed out |
+| `KaiConfigurationError` | `config:kai_token_missing` | `KAI_ENABLED` is set but `KAI_STORAGE_API_TOKEN` is missing |
 
 ## Development
 
