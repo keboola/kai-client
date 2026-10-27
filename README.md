@@ -347,12 +347,12 @@ async with KaiClient(
 ### Tool Approval for Write Operations
 
 Some tools (like `update_descriptions`, `run_job`, `create_config`) require
-explicit approval before execution. On **kai-agent** (the default backend) a
-tool waiting for approval appears as a `tool-call` event in the
-`input-available` state, and the stream stays open — and blocked — until you
-POST the decision with `submit_approval()`. So the decision has to be made from
-*inside* the streaming loop; the same stream then delivers the tool output and
-the rest of the answer.
+explicit approval before execution. On **kai-agent** (the default backend)
+`send_message()` asks for approval events: a tool waiting for approval is
+announced by a `tool-approval-request` event, and the stream stays open — and
+blocked — until you POST the decision with `submit_approval()`. So the decision
+has to be made from *inside* the streaming loop; the same stream then delivers
+the tool output and the rest of the answer.
 
 ```python
 from kai_client import KaiClient
@@ -364,27 +364,30 @@ client = await KaiClient.from_storage_api(
 
 async with client:
     chat_id = client.new_chat_id()
+    tool_names: dict[str, str] = {}
 
     async for event in client.send_message(chat_id, "Create a new bucket"):
         if event.type == "text":
             print(event.text, end="")
         elif event.type == "tool-call":
-            if event.state == "input-available":
-                print(f"\nTool {event.tool_name} needs approval: {event.input}")
-                # Unblocks this stream; iteration continues with the result.
-                await client.submit_approval(
-                    chat_id=chat_id,
-                    tool_use_id=event.tool_call_id,
-                    approved=True,          # False to deny
-                    # reason="Not right now",
-                )
-            elif event.state == "output-available":
-                print(f"\nTool {event.tool_name} completed")
+            if event.tool_call_id and event.tool_name:
+                tool_names[event.tool_call_id] = event.tool_name
+            if event.state == "output-available":
+                print(f"\nTool {tool_names.get(event.tool_call_id, '?')} completed")
+        elif event.type == "tool-approval-request":
+            print(f"\nTool {tool_names.get(event.tool_call_id, '?')} needs approval")
+            # Unblocks this stream; iteration continues with the result.
+            await client.submit_approval(
+                chat_id=chat_id,
+                tool_use_id=event.tool_call_id,
+                approved=True,          # False to deny
+                # reason="Not right now",
+            )
 ```
 
-Note that read-only tools the backend executes on its own also pass through
-`input-available`; submitting an approval for one of those returns a "no pending
-approval" error, which is safe to ignore.
+Every tool passes through the `input-available` state of a `tool-call` event,
+including read-only tools the backend executes on its own; only
+`tool-approval-request` means the stream waits for a decision.
 
 On the legacy **kai-assistant** backend the flow is different: the first stream
 ends, the server emits a separate `tool-approval-request` event carrying an
@@ -582,7 +585,7 @@ on it (for example to pick an approval flow).
 | `finish` | Stream completed | `finish_reason` |
 | `error` | Error occurred | `message`, `code` |
 
-The `tool-call` event has these states: `started`, `input-available` (waiting for approval or auto-executing), `output-available` (completed).
+The `tool-call` event has these states: `started`, `input-available` (input complete; a following `tool-approval-request` means it waits for approval), `output-available` (completed).
 
 ### Exceptions
 

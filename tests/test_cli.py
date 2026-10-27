@@ -27,6 +27,7 @@ from kai_client.models import (
     Message,
     PingResponse,
     TextEvent,
+    ToolApprovalRequestEvent,
     ToolCallEvent,
     Vote,
 )
@@ -683,6 +684,11 @@ class TestChatApprovalFlowSelection:
                 state="input-available",
                 input={"name": "test"},
             )
+            yield ToolApprovalRequestEvent(
+                type="tool-approval-request",
+                toolCallId="tool-123",
+                approvalId="tool-123",
+            )
             # Reaching here proves the approval was submitted while this same
             # stream was still open (the kai-agent contract).
             order.append(("stream-resumed", mock_client.submit_approval.await_count))
@@ -841,7 +847,7 @@ class TestChatApprovalFlowSelection:
             # stdout to simulate a terminal — a harness artifact, not something
             # the CLI writes (verified against a real piped subprocess).
             lines = [ln for ln in result.stdout.splitlines() if ln.startswith("{")]
-            assert len(lines) == 4, f"expected 4 event lines, got {result.stdout!r}"
+            assert len(lines) == 5, f"expected 5 event lines, got {result.stdout!r}"
             for line in lines:
                 json.loads(line)
             mock_client.submit_approval.assert_awaited_once_with(

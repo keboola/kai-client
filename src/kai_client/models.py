@@ -118,6 +118,9 @@ class ChatRequest(BaseModel):
     selected_chat_model: str = Field(alias="selectedChatModel")
     selected_visibility_type: str = Field(alias="selectedVisibilityType")
     branch_id: Optional[int] = Field(default=None, alias="branchId")
+    supports_approval_requested_event: Optional[bool] = Field(
+        default=None, alias="supportsApprovalRequestedEvent"
+    )
 
 
 class VoteRequest(BaseModel):

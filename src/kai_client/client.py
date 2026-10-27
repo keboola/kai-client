@@ -487,6 +487,11 @@ class KaiClient:
             selected_chat_model="chat-model",
             selected_visibility_type=_normalize_visibility(visibility),
             branch_id=branch_id,
+            # kai-agent then announces a tool that waits for approval with a
+            # tool-approval-request event; kai-assistant has its own flow.
+            supports_approval_requested_event=(
+                None if self.backend is KaiBackend.ASSISTANT else True
+            ),
         )
 
         # Serialize with aliases

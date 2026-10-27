@@ -307,11 +307,16 @@ def _display_event(
     event,
     json_output: bool,
     current_tool_name: dict[str, str],
+    approval_requested_event: bool = False,
 ) -> None:
     """Render a single SSE event (shared by both approval flows).
 
     ``current_tool_name`` maps tool_call_id -> tool_name and is updated in place,
     so that output-available events with a null tool_name still display a name.
+
+    With ``approval_requested_event`` (kai-agent) a tool waits for approval only
+    when a tool-approval-request event names it; every tool passes through
+    ``input-available``, so that state alone says nothing.
     """
     if json_output:
         click.echo(json.dumps(event.model_dump(), default=str))
@@ -330,10 +335,13 @@ def _display_event(
 
         if event.state == "started":
             click.echo(f"\n[Calling {tool_name}...]", nl=False)
-        elif event.state == "input-available":
+        elif event.state == "input-available" and not approval_requested_event:
             click.echo(f"\n[Tool {tool_name} requires approval]")
         elif event.state == "output-available":
             click.echo(f"\n[{tool_name} completed]", nl=False)
+    elif event.type == "tool-approval-request" and approval_requested_event:
+        tool_name = current_tool_name.get(event.tool_call_id or "", "unknown")
+        click.echo(f"\n[Tool {tool_name} requires approval]")
     elif event.type == "tool-output-error":
         click.echo(f"\n[Tool Error: {event.error_text}]", err=True)
     elif event.type == "finish":
@@ -391,26 +399,25 @@ async def _send_and_display_agent(
 ):
     """Stream a message, resolving approvals inline via ``submit_approval``.
 
-    On kai-agent a tool that needs approval is announced by a tool-call event in
-    the ``input-available`` state and the stream then blocks until the decision is
-    POSTed to the approval endpoint. The decision therefore has to be made from
-    inside the streaming loop; the same stream afterwards carries the
+    On kai-agent a tool that needs approval is announced by a tool-approval-request
+    event (``send_message`` asks for it) and the stream then blocks until the
+    decision is POSTed to the approval endpoint. The decision therefore has to be
+    made from inside the streaming loop; the same stream afterwards carries the
     post-approval events (tool output, further text, finish).
 
     Tools the backend executes without asking (read-only ones, or ones the user
-    marked ``always_allow``) also pass through ``input-available``, so this may
-    prompt for a tool that needed no approval. The resulting POST then answers
-    nothing and is reported as non-fatal rather than aborting the stream.
+    marked ``always_allow``) get no such event and are not prompted for. A POST
+    that still answers nothing is reported as non-fatal rather than aborting the
+    stream.
     """
     current_tool_name: dict[str, str] = {}
     decided: set[str] = set()
 
     async for event in client.send_message(chat_id, message):
-        _display_event(event, json_output, current_tool_name)
+        _display_event(event, json_output, current_tool_name, approval_requested_event=True)
 
         if (
-            event.type != "tool-call"
-            or event.state != "input-available"
+            event.type != "tool-approval-request"
             or not event.tool_call_id
             or event.tool_call_id in decided
         ):
@@ -425,9 +432,9 @@ async def _send_and_display_agent(
                 approved=approved,
             )
         except KaiNotFoundError as e:
-            # Not fatal, and only this case: a tool the backend auto-executes
-            # (e.g. a read-only one) has no pending approval to answer, so the
-            # POST 404s. Report it and keep streaming.
+            # Not fatal, and only this case: the approval is no longer pending
+            # (or not registered yet), so the POST 404s. Report it and keep
+            # streaming.
             #
             # Anything else — auth failure, 500, connection loss, timeout — is
             # deliberately NOT caught. Swallowing those would leave the tool
