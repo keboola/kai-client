@@ -150,10 +150,9 @@ async for event in client.send_message(
 ):
     if isinstance(event, TextEvent):
         print(event.text, end="")
-    elif isinstance(event, ToolCallEvent):
-        if event.state == "input-available":
-            # Tool needs approval
-            pass
+    elif isinstance(event, ToolApprovalRequestEvent):
+        # Tool waits for approval: answer with submit_approval (see Tool Approval)
+        pass
     elif isinstance(event, FinishEvent):
         print(f"Finished: {event.finish_reason}")
 ```
@@ -176,14 +175,15 @@ async for event in client.send_message(
 
 ### Tool Approval
 
-When the AI needs to execute a write operation, it sends a `ToolCallEvent` with
-`state="input-available"`. On **kai-agent** the stream stays open and blocked
-until the decision is submitted, so call `submit_approval` from inside the
-streaming loop — the same stream then continues with the tool output:
+When the AI needs to execute a write operation on **kai-agent**, it sends a
+`tool-approval-request` event (`send_message` asks kai-agent for it). The stream
+stays open and blocked until the decision is submitted, so call
+`submit_approval` from inside the streaming loop — the same stream then
+continues with the tool output:
 
 ```python
 async for event in client.send_message(chat_id, "Create a bucket"):
-    if event.type == "tool-call" and event.state == "input-available":
+    if event.type == "tool-approval-request":
         await client.submit_approval(
             chat_id=chat_id,
             tool_use_id=event.tool_call_id,  # the toolCallId of that event
@@ -193,9 +193,9 @@ async for event in client.send_message(chat_id, "Create a bucket"):
 ```
 
 `submit_approval` is a plain POST (not a stream) and returns an
-`ApprovalResponse`. Read-only tools the backend runs on its own also pass
-through `input-available`; submitting an approval for one of them returns a
-"no pending approval" error that is safe to ignore.
+`ApprovalResponse`. Every tool, including read-only ones the backend runs on its
+own, passes through the `input-available` state of a `tool-call` event; only
+`tool-approval-request` means the stream waits for a decision.
 
 On the legacy **kai-assistant** backend the first stream ends instead, and the
 reply is sent with `approve_tool` / `reject_tool` (v6 flow, using the
@@ -297,7 +297,7 @@ Messages can contain multiple parts:
 ### Tool Call States
 
 - `started`: Tool call beginning
-- `input-available`: Waiting for user approval
+- `input-available`: Input complete; a following `tool-approval-request` means it waits for approval
 - `output-available`: Tool completed successfully
 - `output-error`: Tool execution failed
 

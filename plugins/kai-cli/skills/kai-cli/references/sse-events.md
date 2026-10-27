@@ -40,7 +40,7 @@ Indicate tool execution at various stages:
 ### States
 
 1. **`started`**: Tool invocation beginning
-2. **`input-available`**: Tool parameters ready, waiting for approval
+2. **`input-available`**: Tool parameters ready; the tool runs, or waits for approval when a `tool-approval-request` event follows
 3. **`output-available`**: Tool completed successfully
 4. **`output-error`**: Tool execution failed
 
@@ -64,18 +64,18 @@ Indicate tool execution at various stages:
 
 ### Approval Workflow
 
-When `state` is `input-available`, a tool may be waiting for user approval. On
-the default **kai-agent** backend the stream stays open and blocked until the
-decision is POSTed, so answer with `submit_approval` from inside the loop and
-keep iterating — the same stream carries the tool output afterwards:
+On the default **kai-agent** backend a tool that waits for user approval is
+announced by a `tool-approval-request` event (`send_message` asks for it). The
+stream stays open and blocked until the decision is POSTed, so answer with
+`submit_approval` from inside the loop and keep iterating — the same stream
+carries the tool output afterwards:
 
 ```python
 async for event in client.send_message(chat_id, text):
     process_event(event)
 
-    if isinstance(event, ToolCallEvent) and event.state == "input-available":
-        print(f"Tool {event.tool_name} needs approval")
-        print(f"Input: {event.input}")
+    if isinstance(event, ToolApprovalRequestEvent):
+        print(f"Tool {event.tool_call_id} needs approval")
 
         await client.submit_approval(
             chat_id=chat_id,
@@ -86,9 +86,9 @@ async for event in client.send_message(chat_id, text):
 ```
 
 `submit_approval` is a non-streaming POST returning an `ApprovalResponse`.
-Read-only tools that the backend executes on its own also pass through
-`input-available`; an approval submitted for one of those returns a "no pending
-approval" error that is safe to ignore.
+Every tool passes through `input-available`, including read-only tools the
+backend executes on its own; those get no `tool-approval-request` and need no
+answer.
 
 On the legacy **kai-assistant** backend the first stream ends instead, and the
 decision is sent with `client.approve_tool(chat_id, approval_id)` /
@@ -166,8 +166,10 @@ async def process_chat(client, chat_id, text, auto_approve=False):
                 print(f"\n[Starting tool: {event.tool_name}]")
 
             case ToolCallEvent() if event.state == "input-available":
-                print(f"\n[Tool {event.tool_name} requires approval]")
                 print(f"Input: {json.dumps(event.input, indent=2)}")
+
+            case ToolApprovalRequestEvent():
+                print(f"\n[Tool {event.tool_call_id} requires approval]")
 
                 # kai-agent: unblocks this stream, which then continues below
                 await client.submit_approval(

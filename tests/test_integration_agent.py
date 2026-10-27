@@ -108,6 +108,31 @@ def _make_handler(state: _StubAgentState):
                 }
             )
 
+            if state.approval_mode == "auto_executed":
+                # kai-agent runs a tool that needs no approval without asking.
+                self._send_event(
+                    {
+                        "type": "tool-output-available",
+                        "toolCallId": TOOL_CALL_ID,
+                        "output": {"id": "in.c-test-bucket"},
+                    }
+                )
+                self._send_event({"type": "finish", "finishReason": "stop"})
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+                state.note("chat:done")
+                return
+
+            # kai-agent announces the wait only to a client that asked for it.
+            if body.get("supportsApprovalRequestedEvent") is True:
+                self._send_event(
+                    {
+                        "type": "tool-approval-request",
+                        "toolCallId": TOOL_CALL_ID,
+                        "approvalId": TOOL_CALL_ID,
+                    }
+                )
+
             # Block until the approval POST lands on another thread.
             slot = {"event": threading.Event(), "approved": False}
             with state.lock:
@@ -239,10 +264,30 @@ async def test_denial_is_submitted_and_stream_continues(stub_agent, capsys, monk
     assert "Okay, skipped it." in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("stub_agent", ["auto_executed"], indirect=True)
+@pytest.mark.asyncio
+async def test_a_tool_without_an_approval_request_is_not_prompted(stub_agent, capsys, monkeypatch):
+    """Every tool passes through input-available; only the approval request asks."""
+    base_url, state = stub_agent
+
+    def fail_confirm(*_args, **_kwargs):
+        raise AssertionError("must not prompt for a tool kai-agent runs without asking")
+
+    monkeypatch.setattr("kai_client.cli.click.confirm", fail_confirm)
+
+    async with _client(base_url) as client:
+        await _send_and_display_agent(
+            client, "chat-1", "Read something", auto_approve=False, json_output=False
+        )
+
+    assert state.log == ["chat:start", "chat:done"]
+    assert "requires approval" not in capsys.readouterr().out
+
+
 @pytest.mark.parametrize("stub_agent", ["not_found"], indirect=True)
 @pytest.mark.asyncio
 async def test_approval_404_is_not_fatal(stub_agent, capsys):
-    """kai-agent announces auto-executed tools too, so the POST can 404.
+    """An approval that is no longer pending answers the POST with a 404.
 
     Also pins that the nested error envelope is parsed into KaiNotFoundError —
     without that, the CLI's narrow `except` could not catch this.

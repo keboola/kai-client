@@ -95,6 +95,17 @@ class TestParseSSEEvent:
         assert isinstance(event, ErrorEvent)
         assert event.code is None
 
+    def test_parse_error_event_with_error_text(self):
+        data = {"type": "error", "errorText": "SDK execution failed"}
+        event = parse_sse_event(data)
+        assert isinstance(event, ErrorEvent)
+        assert event.message == "SDK execution failed"
+
+    def test_parse_error_event_without_text(self):
+        event = parse_sse_event({"type": "error"})
+        assert isinstance(event, ErrorEvent)
+        assert event.message == "Unknown error"
+
     def test_parse_unknown_event(self):
         data = {"type": "custom-event", "foo": "bar", "count": 42}
         event = parse_sse_event(data)

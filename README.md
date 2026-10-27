@@ -117,6 +117,9 @@ STORAGE_API_TOKEN=your-keboola-token
 STORAGE_API_URL=https://connection.keboola.com
 ```
 
+When `KAI_STORAGE_API_TOKEN` is set, the CLI uses it instead of `STORAGE_API_TOKEN`; an
+explicit `--token` still wins. See [Storage API Token in Data Apps](#storage-api-token-in-data-apps).
+
 ### Commands
 
 #### Health & Info
@@ -344,12 +347,12 @@ async with KaiClient(
 ### Tool Approval for Write Operations
 
 Some tools (like `update_descriptions`, `run_job`, `create_config`) require
-explicit approval before execution. On **kai-agent** (the default backend) a
-tool waiting for approval appears as a `tool-call` event in the
-`input-available` state, and the stream stays open — and blocked — until you
-POST the decision with `submit_approval()`. So the decision has to be made from
-*inside* the streaming loop; the same stream then delivers the tool output and
-the rest of the answer.
+explicit approval before execution. On **kai-agent** (the default backend)
+`send_message()` asks for approval events: a tool waiting for approval is
+announced by a `tool-approval-request` event, and the stream stays open — and
+blocked — until you POST the decision with `submit_approval()`. So the decision
+has to be made from *inside* the streaming loop; the same stream then delivers
+the tool output and the rest of the answer.
 
 ```python
 from kai_client import KaiClient
@@ -361,27 +364,30 @@ client = await KaiClient.from_storage_api(
 
 async with client:
     chat_id = client.new_chat_id()
+    tool_names: dict[str, str] = {}
 
     async for event in client.send_message(chat_id, "Create a new bucket"):
         if event.type == "text":
             print(event.text, end="")
         elif event.type == "tool-call":
-            if event.state == "input-available":
-                print(f"\nTool {event.tool_name} needs approval: {event.input}")
-                # Unblocks this stream; iteration continues with the result.
-                await client.submit_approval(
-                    chat_id=chat_id,
-                    tool_use_id=event.tool_call_id,
-                    approved=True,          # False to deny
-                    # reason="Not right now",
-                )
-            elif event.state == "output-available":
-                print(f"\nTool {event.tool_name} completed")
+            if event.tool_call_id and event.tool_name:
+                tool_names[event.tool_call_id] = event.tool_name
+            if event.state == "output-available":
+                print(f"\nTool {tool_names.get(event.tool_call_id, '?')} completed")
+        elif event.type == "tool-approval-request":
+            print(f"\nTool {tool_names.get(event.tool_call_id, '?')} needs approval")
+            # Unblocks this stream; iteration continues with the result.
+            await client.submit_approval(
+                chat_id=chat_id,
+                tool_use_id=event.tool_call_id,
+                approved=True,          # False to deny
+                # reason="Not right now",
+            )
 ```
 
-Note that read-only tools the backend executes on its own also pass through
-`input-available`; submitting an approval for one of those returns a "no pending
-approval" error, which is safe to ignore.
+Every tool passes through the `input-available` state of a `tool-call` event,
+including read-only tools the backend executes on its own; only
+`tool-approval-request` means the stream waits for a decision.
 
 On the legacy **kai-assistant** backend the flow is different: the first stream
 ends, the server emits a separate `tool-approval-request` event carrying an
@@ -460,6 +466,42 @@ client = await KaiClient.from_storage_api(
 This method auto-discovers the **kai-agent** service URL from your Keboola stack
 (the modern agent backend). To target the legacy `kai-assistant` backend
 (single-tenant deployments only), pass `service=KaiBackend.ASSISTANT`.
+
+#### Storage API Token in Data Apps
+
+A Data App deployed with Kai enabled gets a dedicated Kai token in the
+`KAI_STORAGE_API_TOKEN` env var (together with `KAI_ENABLED`). kai-agent scopes that
+token to the app's own workspace, so pass it together with `WORKSPACE_ID`. Only kai-agent
+does this scoping — do not combine the Kai token with `service=KaiBackend.ASSISTANT`.
+`resolve_storage_api_token()` picks the right token from the environment:
+
+```python
+import os
+
+from kai_client import KaiClient, resolve_storage_api_token
+
+token = resolve_storage_api_token()  # may raise KaiConfigurationError, see below
+if not token:
+    raise RuntimeError("Set STORAGE_API_TOKEN")
+
+client = await KaiClient.from_storage_api(
+    storage_api_token=token,
+    storage_api_url=os.environ["STORAGE_API_URL"],
+    workspace_id=os.environ.get("WORKSPACE_ID") or None,
+)
+```
+
+The token is resolved in this order:
+
+1. A token passed explicitly, e.g. `resolve_storage_api_token(my_token)`.
+2. `KAI_STORAGE_API_TOKEN`.
+3. `STORAGE_API_TOKEN` — only when `KAI_ENABLED` is not set. With `KAI_ENABLED` set and
+   no Kai token, it raises `KaiConfigurationError` instead of falling back to the user's
+   token: redeploy the app as a user who is allowed to create Storage API tokens.
+
+It returns `None` when no token is available. The `kai` CLI resolves its token the same way.
+The Kai token expires after 90 days; an expired or revoked one makes kai-agent reject requests
+with an authentication error, and the remedy is the same redeploy.
 
 #### Backend Support
 
@@ -543,7 +585,7 @@ on it (for example to pick an approval flow).
 | `finish` | Stream completed | `finish_reason` |
 | `error` | Error occurred | `message`, `code` |
 
-The `tool-call` event has these states: `started`, `input-available` (waiting for approval or auto-executing), `output-available` (completed).
+The `tool-call` event has these states: `started`, `input-available` (input complete; a following `tool-approval-request` means it waits for approval), `output-available` (completed).
 
 ### Exceptions
 
@@ -558,6 +600,7 @@ The `tool-call` event has these states: `started`, `input-available` (waiting fo
 | `KaiStreamError` | - | SSE stream error |
 | `KaiConnectionError` | - | Connection failed |
 | `KaiTimeoutError` | - | Request timed out |
+| `KaiConfigurationError` | `config:kai_token_missing` | `KAI_ENABLED` is set but `KAI_STORAGE_API_TOKEN` is missing |
 
 ## Development
 

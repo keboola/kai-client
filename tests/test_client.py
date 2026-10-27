@@ -552,6 +552,32 @@ class TestSendMessage:
         assert body["message"]["parts"][0]["text"] == "Hi there"
         assert body["selectedChatModel"] == "chat-model"
         assert body["selectedVisibilityType"] == "private"
+        assert body["supportsApprovalRequestedEvent"] is True
+
+    @pytest.mark.asyncio
+    async def test_send_message_does_not_ask_kai_assistant_for_approval_events(
+        self, httpx_mock: HTTPXMock
+    ):
+        """kai-assistant has its own approval flow, so the flag is left out."""
+        httpx_mock.add_response(
+            method="POST",
+            url="https://kai.example.com/api/chat",
+            content=b'data: {"type":"finish","finishReason":"stop"}\n\ndata: [DONE]\n\n',
+            headers={"Content-Type": "text/event-stream"},
+        )
+        client = KaiClient(
+            storage_api_token="test-token",
+            storage_api_url="https://connection.example.com",
+            base_url="https://kai.example.com",
+            backend=KaiBackend.ASSISTANT,
+        )
+
+        async with client:
+            async for _event in client.send_message("chat-123", "Hi there"):
+                pass
+
+        body = json.loads(httpx_mock.get_request().content)
+        assert "supportsApprovalRequestedEvent" not in body
 
     @pytest.mark.asyncio
     async def test_send_message_streams_events(self, client: KaiClient, httpx_mock: HTTPXMock):

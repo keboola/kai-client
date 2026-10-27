@@ -19,6 +19,10 @@ export STORAGE_API_TOKEN="your-keboola-storage-api-token"
 export STORAGE_API_URL="https://connection.keboola.com"
 ```
 
+Inside a Data App deployed with Kai, the dedicated `KAI_STORAGE_API_TOKEN` wins over
+`STORAGE_API_TOKEN`; if `KAI_ENABLED` is set but the Kai token is missing, the CLI exits with an
+error instead of using the user's token.
+
 Alternatively, load from a `.env.local` file:
 ```bash
 set -a && source .env.local && set +a
@@ -198,7 +202,7 @@ of them:
 
 | Option | Env var | Default | Purpose |
 |--------|---------|---------|---------|
-| `--token` | `STORAGE_API_TOKEN` | — | Keboola Storage API token |
+| `--token` | `KAI_STORAGE_API_TOKEN`, then `STORAGE_API_TOKEN` | — | Keboola Storage API token |
 | `--url` | `STORAGE_API_URL` | — | Keboola Storage API URL |
 | `--base-url` | `KAI_BASE_URL` | auto-discover | Kai API base URL for local development |
 | `--service` | `KAI_SERVICE` | `agent` | Which backend to discover; ignored with `--base-url` |
@@ -250,6 +254,9 @@ kai vote CHAT_ID MSG_ID up
 Common error scenarios:
 
 - **Missing credentials**: Set `STORAGE_API_TOKEN` and `STORAGE_API_URL`
+- **`KAI_ENABLED is set but KAI_STORAGE_API_TOKEN is missing`** (inside a Data App): redeploy
+  the app as a user who is allowed to create Storage API tokens; the same applies when the
+  Kai token has expired (90 days) or was revoked
 - **Connection refused**: Check network and server availability with `kai ping`
 - **Authentication failed**: Verify token is valid and has required permissions
 - **Rate limited**: Wait and retry, or reduce request frequency

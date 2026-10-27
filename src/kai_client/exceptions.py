@@ -63,6 +63,10 @@ class KaiTimeoutError(KaiError):
     """Raised when a request times out."""
 
 
+class KaiConfigurationError(KaiError):
+    """Raised when the client cannot be configured from its environment."""
+
+
 # Mapping of API error codes to exception classes
 ERROR_CODE_MAP: dict[str, type[KaiError]] = {
     "unauthorized:chat": KaiAuthenticationError,

@@ -23,9 +23,11 @@ Example:
 """
 
 from kai_client.client import KaiClient
+from kai_client.credentials import resolve_storage_api_token
 from kai_client.exceptions import (
     KaiAuthenticationError,
     KaiBadRequestError,
+    KaiConfigurationError,
     KaiConnectionError,
     KaiError,
     KaiForbiddenError,
@@ -85,7 +87,7 @@ from kai_client.types import (
     VoteType,
 )
 
-__version__ = "0.13.0"
+__version__ = "0.14.0"
 
 __all__ = [
     # Main client
@@ -100,6 +102,9 @@ __all__ = [
     "KaiStreamError",
     "KaiConnectionError",
     "KaiTimeoutError",
+    "KaiConfigurationError",
+    # Credentials
+    "resolve_storage_api_token",
     # Request models
     "ChatRequest",
     "MessageRequest",
