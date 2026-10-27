@@ -98,10 +98,11 @@ async def get_client() -> KaiClient:
 
 > **Note:** the tool-approval pattern shown further down uses `approve_tool` /
 > `reject_tool`, which only work against the legacy kai-assistant backend. Add
-> `service=KaiBackend.ASSISTANT` to the call above when using it. On kai-agent
-> the decision goes to `submit_approval` while the original stream is still
-> open, which does not fit Streamlit's rerun model — see the README's "Tool
-> Approval for Write Operations" section.
+> `service=KaiBackend.ASSISTANT` to the call above when using it. kai-agent sends
+> the same `tool-approval-request` event, but the decision goes to
+> `submit_approval(tool_use_id=event.tool_call_id)` while the original stream is
+> still open, which does not fit Streamlit's rerun model — see the README's
+> "Tool Approval for Write Operations" section.
 
 > **Gotcha:** Using `KaiClient(token, url)` directly causes `httpx.RemoteProtocolError: illegal request line` because it sends requests to localhost.
 

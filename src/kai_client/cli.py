@@ -433,8 +433,8 @@ async def _send_and_display_agent(
             )
         except KaiNotFoundError as e:
             # Not fatal, and only this case: the approval is no longer pending
-            # (or not registered yet), so the POST 404s. Report it and keep
-            # streaming.
+            # (timed out, or the chat was stopped), so the POST 404s. Report it
+            # and keep streaming.
             #
             # Anything else — auth failure, 500, connection loss, timeout — is
             # deliberately NOT caught. Swallowing those would leave the tool
