@@ -15,14 +15,14 @@ In a Keboola Data App deployed with Kai, KAI_STORAGE_API_TOKEN, KAI_ENABLED, KBC
 and WORKSPACE_ID are injected for you; resolve_storage_api_token() prefers the Kai token.
 
 Tool approvals are not supported in this example:
-  - kai-agent keeps the chat stream open while a write tool waits for a decision, and
-    the decision must be posted with submit_approval() while that stream is still open.
-  - Streamlit reruns the script on every button click, which ends the stream, and
-    kai-client does not request the event that says which tool is waiting.
-  - A write tool therefore waits until kai-agent denies it (after 5 minutes). Deploy the
-    app with a direct-grant input mapping (strict mode), where Kai has no write tools.
-  - Questions to the user (AskUserQuestion) and plan cards (ExitPlanMode) would wait
-    forever, so the app declines them as soon as they appear.
+  - kai-client asks kai-agent to announce a waiting tool (a write tool, a question to the
+    user or a plan card) with a tool-approval-request event, and the stream stays open
+    until submit_approval() answers it.
+  - Streamlit reruns the script on every button click, which ends the stream, so the app
+    cannot wait for the user's decision.
+  - The app therefore denies every request as soon as it appears, and Kai continues
+    without that tool. Deploy the app with a direct-grant input mapping (strict mode),
+    where Kai has no write tools.
 """
 
 import asyncio
@@ -33,7 +33,13 @@ from pathlib import Path
 import streamlit as st
 from dotenv import load_dotenv
 
-from kai_client import KaiClient, KaiConfigurationError, KaiError, resolve_storage_api_token
+from kai_client import (
+    KaiClient,
+    KaiConfigurationError,
+    KaiError,
+    KaiNotFoundError,
+    resolve_storage_api_token,
+)
 
 # Load credentials from .env.local (same as the kai CLI)
 _env_local = Path(__file__).resolve().parent.parent / ".env.local"
@@ -84,13 +90,12 @@ with st.sidebar:
         st.rerun()
     st.caption(f"Chat ID: `{st.session_state.chat_id[:8]}...`")
     st.caption(
-        "Write actions need an approval this example cannot collect; "
-        "they are denied after 5 minutes."
+        "Write actions and questions need an answer this example cannot collect; "
+        "it declines them."
     )
 
 
-# Tools that wait for the user with no timeout; this app cannot show them.
-INTERACTIVE_TOOLS = ("AskUserQuestion", "ExitPlanMode")
+DENY_REASON = "This app cannot show approvals or questions to the user. Continue without them."
 
 
 # --- Helpers ---
@@ -144,6 +149,18 @@ async def get_client() -> KaiClient:
     )
 
 
+async def deny_approval(client: KaiClient, chat_id: str, tool_call_id: str) -> None:
+    """Deny a waiting tool; retry once on 404, as kai-agent already waits 10 s before it."""
+    try:
+        await client.submit_approval(
+            chat_id=chat_id, tool_use_id=tool_call_id, approved=False, reason=DENY_REASON
+        )
+    except KaiNotFoundError:
+        await client.submit_approval(
+            chat_id=chat_id, tool_use_id=tool_call_id, approved=False, reason=DENY_REASON
+        )
+
+
 async def collect_chat_response(chat_id, text, container):
     """Stream a chat response into a container. Returns the full text."""
     accumulated = ""
@@ -163,18 +180,7 @@ async def collect_chat_response(chat_id, text, container):
                 if name:
                     tool_names[call_id] = name
                 display_name = name or tool_names.get(call_id, "tool")
-                if state == "input-available" and any(t in display_name for t in INTERACTIVE_TOOLS):
-                    try:
-                        await client.submit_approval(
-                            chat_id=chat_id,
-                            tool_use_id=call_id,
-                            approved=False,
-                            reason="This app cannot show questions or plans to the user. "
-                            "Continue without asking.",
-                        )
-                    except KaiError as e:
-                        container.warning(f"Could not decline **{display_name}**: {e.message}")
-                elif state == "input-available":
+                if state == "input-available":
                     # Finalize current text, show tool status, start new text placeholder
                     text_placeholder.markdown(accumulated)
                     container.info(f"Calling **{display_name}**...")
@@ -183,6 +189,13 @@ async def collect_chat_response(chat_id, text, container):
                     text_placeholder.markdown(accumulated)
                     container.info(f"**{display_name}** completed.")
                     text_placeholder = container.empty()
+            elif event.type == "tool-approval-request":
+                display_name = tool_names.get(event.tool_call_id, "tool")
+                try:
+                    await deny_approval(client, chat_id, event.tool_call_id)
+                    container.info(f"Declined **{display_name}**: this app cannot ask you.")
+                except KaiError as e:
+                    container.warning(f"Could not decline **{display_name}**: {e.message}")
             elif event.type == "tool-output-error":
                 display_name = tool_names.get(event.tool_call_id, "tool")
                 text_placeholder.markdown(accumulated)

@@ -59,6 +59,11 @@ After approval/rejection, streaming resumes with the same event types.
 > decision goes to `submit_approval()` while the original `send_message()` stream
 > is still open, which does not fit Streamlit's rerun model. See the `kai-cli`
 > skill's `references/api-details.md` for that protocol.
+>
+> **Not with the Kai token.** In an app deployed with Kai (`KAI_STORAGE_API_TOKEN`), only
+> kai-agent scopes the token to the app's workspace: never use `service=KaiBackend.ASSISTANT`
+> there. Deny every `tool-approval-request` with `submit_approval(..., approved=False)`
+> instead, as `examples/streamlit_app.py` does.
 
 ## Next Actions
 

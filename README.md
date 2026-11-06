@@ -470,7 +470,8 @@ This method auto-discovers the **kai-agent** service URL from your Keboola stack
 #### Storage API Token in Data Apps
 
 A Data App deployed with Kai enabled gets a dedicated Kai token in the
-`KAI_STORAGE_API_TOKEN` env var (together with `KAI_ENABLED`). kai-agent scopes that
+`KAI_STORAGE_API_TOKEN` env var (together with `KAI_ENABLED`). The Storage API URL is in
+`KBC_URL` there; `STORAGE_API_URL` comes only from a local `.env.local`. kai-agent scopes that
 token to the app's own workspace, so pass it together with `WORKSPACE_ID`. Only kai-agent
 does this scoping — do not combine the Kai token with `service=KaiBackend.ASSISTANT`.
 `resolve_storage_api_token()` picks the right token from the environment:
@@ -486,7 +487,7 @@ if not token:
 
 client = await KaiClient.from_storage_api(
     storage_api_token=token,
-    storage_api_url=os.environ["STORAGE_API_URL"],
+    storage_api_url=os.environ.get("STORAGE_API_URL") or os.environ["KBC_URL"],
     workspace_id=os.environ.get("WORKSPACE_ID") or None,
 )
 ```

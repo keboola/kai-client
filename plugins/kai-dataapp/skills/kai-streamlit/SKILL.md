@@ -44,7 +44,8 @@ try:
 except KaiConfigurationError as e:
     st.error(e.message)
     st.stop()
-api_url = os.environ.get("STORAGE_API_URL", "")
+# KBC_URL in a deployed Data App, STORAGE_API_URL locally
+api_url = os.environ.get("STORAGE_API_URL") or os.environ.get("KBC_URL", "")
 workspace_id = os.environ.get("WORKSPACE_ID") or None
 
 if not token or not api_url:
@@ -96,13 +97,15 @@ async def get_client() -> KaiClient:
     )
 ```
 
-> **Note:** the tool-approval pattern shown further down uses `approve_tool` /
-> `reject_tool`, which only work against the legacy kai-assistant backend. Add
-> `service=KaiBackend.ASSISTANT` to the call above when using it. kai-agent sends
-> the same `tool-approval-request` event, but the decision goes to
-> `submit_approval(tool_use_id=event.tool_call_id)` while the original stream is
-> still open, which does not fit Streamlit's rerun model — see the README's
-> "Tool Approval for Write Operations" section.
+> **Note:** in an app deployed with Kai (`KAI_STORAGE_API_TOKEN` set), tool approvals are
+> not available. Keep the default kai-agent backend: only kai-agent scopes the Kai token to the
+> app's workspace. kai-agent announces a waiting tool (a write tool, a question to the user or a plan card)
+> with a `tool-approval-request` event and keeps the stream open until `submit_approval()`
+> answers it, which does not fit Streamlit's rerun model. So deny every such request in the
+> streaming loop, as `examples/streamlit_app.py` does, and deploy the app with a direct-grant
+> input mapping (strict mode), where Kai has no write tools. The Approve/Deny flow under
+> "Tool Approval Flow" works only with the legacy kai-assistant backend and the user's own
+> `STORAGE_API_TOKEN`, never with the Kai token.
 
 > **Gotcha:** Using `KaiClient(token, url)` directly causes `httpx.RemoteProtocolError: illegal request line` because it sends requests to localhost.
 
@@ -160,6 +163,7 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "chat_id" not in st.session_state:
     st.session_state.chat_id = KaiClient.new_chat_id()
+# kai-assistant only, for the Tool Approval Flow below
 if "pending_approval" not in st.session_state:
     st.session_state.pending_approval = None
 if "suggestions" not in st.session_state:
@@ -189,6 +193,11 @@ async def collect_chat_response(chat_id, text, container):
 ```
 
 ## Tool Approval Flow
+
+> **Not for apps deployed with Kai.** This flow uses `approve_tool` / `reject_tool`, which work
+> only against the legacy kai-assistant backend (`service=KaiBackend.ASSISTANT`) with the user's
+> own `STORAGE_API_TOKEN`. With `KAI_STORAGE_API_TOKEN`, stay on kai-agent and deny every
+> `tool-approval-request` instead (see the note under "Client Creation").
 
 When Kai calls a write tool, the stream pauses with a `tool-approval-request` event. Handle it with Approve/Deny buttons:
 
@@ -345,7 +354,7 @@ Key events for Streamlit integration:
 | `text` | Append to `accumulated`, update `placeholder.markdown()` |
 | `tool-call` (state: `input-available`) | Show `container.info("Calling tool...")` |
 | `tool-call` (state: `output-available`) | Show `container.info("tool completed.")` |
-| `tool-approval-request` | Store in `st.session_state.pending_approval` |
+| `tool-approval-request` | kai-agent: deny with `submit_approval(..., approved=False)`; kai-assistant only: store in `st.session_state.pending_approval` |
 | `error` | Show `container.error(event.message)` |
 
 ## Reference Example

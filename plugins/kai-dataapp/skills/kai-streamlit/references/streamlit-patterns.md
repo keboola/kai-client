@@ -6,11 +6,11 @@ A Kai-integrated Streamlit app follows this structure:
 
 ```
 1. Load credentials from .env.local
-2. Initialize session state (messages, chat_id, pending_approval, suggestions)
+2. Initialize session state (messages, chat_id, suggestions; pending_approval on kai-assistant only)
 3. Render sidebar (New Chat button, chat ID display)
 4. Render chat history from session state
 5. Render suggestion buttons (if any)
-6. Render tool approval UI (if pending)
+6. Render tool approval UI (if pending; kai-assistant only — with the Kai token, deny approvals while streaming)
 7. Handle chat input (from text box or suggestion button)
 8. Stream response, extract suggestions, update session state
 9. st.rerun() to render the new state
@@ -93,7 +93,7 @@ Reset all relevant state:
 if st.button("New Chat"):
     st.session_state.messages = []
     st.session_state.chat_id = KaiClient.new_chat_id()
-    st.session_state.pending_approval = None
+    st.session_state.pending_approval = None  # kai-assistant approval flow only
     st.session_state.suggestions = []
     st.rerun()
 ```
