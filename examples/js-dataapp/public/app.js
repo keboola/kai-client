@@ -26,6 +26,8 @@ let pendingApprovals = [];
 let isStreaming = false;
 let kaiUnavailable = false;
 let streamAbort = null;
+// The chat whose last turn may still run on kai-agent: it sent no finish, even after the stream was lost.
+let unfinishedChatId = null;
 
 // ── Helpers ──
 
@@ -252,6 +254,7 @@ async function sendMessage(text) {
   const turnChatId = chatId;
   streamAbort = new AbortController();
   let finished = false;
+  unfinishedChatId = turnChatId;
   const payload = { id: turnChatId, text };
 
   try {
@@ -310,6 +313,7 @@ async function sendMessage(text) {
 
           case "finish":
             finished = true;
+            if (unfinishedChatId === turnChatId) unfinishedChatId = null;
             break;
         }
       }
@@ -320,6 +324,8 @@ async function sendMessage(text) {
     }
 
     if (!res) {
+      // kai-agent refused the request, so no turn started.
+      if (unfinishedChatId === turnChatId) unfinishedChatId = null;
       container.remove();
     } else if (accumulated) {
       content.innerHTML = renderMarkdown(accumulated);
@@ -410,11 +416,12 @@ chatForm.addEventListener("submit", (e) => {
 });
 
 newChatBtn.addEventListener("click", () => {
-  if (isStreaming) {
-    // Closing the stream does not stop the turn on kai-agent.
-    fetch(`/api/chat/${chatId}/stop`, { method: "POST" }).catch((err) =>
+  if (unfinishedChatId) {
+    // Closing the stream does not stop the turn on kai-agent, and a lost stream leaves it running too.
+    fetch(`/api/chat/${unfinishedChatId}/stop`, { method: "POST" }).catch((err) =>
       console.error("Stop failed:", err)
     );
+    unfinishedChatId = null;
   }
   if (streamAbort) streamAbort.abort();
   chatId = crypto.randomUUID();

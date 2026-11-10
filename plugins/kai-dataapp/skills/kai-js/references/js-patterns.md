@@ -154,11 +154,15 @@ decision can no longer apply.
 
 ## New Chat Reset
 
-Stop the running turn, abort its stream and reset all state:
+Stop the turn that may still run, abort its stream and reset all state. Track that turn apart
+from `isStreaming`: set `unfinishedChatId = turnChatId` when the message is sent, and clear it on
+`finish` or when the request is refused. A stream lost without `finish` ends `isStreaming`, but
+the turn keeps running on kai-agent.
 
 ```javascript
 newChatBtn.addEventListener("click", () => {
-  if (isStreaming) fetch(`/api/chat/${chatId}/stop`, { method: "POST" }); // backend proxies to kai-agent
+  if (unfinishedChatId) fetch(`/api/chat/${unfinishedChatId}/stop`, { method: "POST" }); // backend proxies to kai-agent
+  unfinishedChatId = null;
   if (streamAbort) streamAbort.abort(); // the AbortController passed to the chat fetch
   chatId = crypto.randomUUID();
   messagesEl.innerHTML = "";

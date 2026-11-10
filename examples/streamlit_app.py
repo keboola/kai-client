@@ -28,6 +28,7 @@ Tool approvals are not supported in this example:
 import asyncio
 import os
 import re
+from contextlib import aclosing
 from pathlib import Path
 
 import streamlit as st
@@ -168,8 +169,9 @@ async def collect_chat_response(chat_id, text, container):
     text_placeholder = container.empty()
     client = await get_client()
 
-    async with client:
-        async for event in client.send_message(chat_id, text):
+    # aclosing() closes the stream when this function returns early.
+    async with client, aclosing(client.send_message(chat_id, text)) as events:
+        async for event in events:
             if event.type == "text":
                 accumulated += event.text
                 text_placeholder.markdown(accumulated + "▌")
@@ -195,7 +197,16 @@ async def collect_chat_response(chat_id, text, container):
                     await deny_approval(client, chat_id, event.tool_call_id)
                     container.info(f"Declined **{display_name}**: this app cannot ask you.")
                 except KaiError as e:
-                    container.warning(f"Could not decline **{display_name}**: {e.message}")
+                    # A conflict (409) means the request is already resolved, so Kai goes on.
+                    code = e.code or ""
+                    if not (code.startswith("conflict") or code == "http:409"):
+                        # Still waiting: the turn stays blocked until kai-agent times it out.
+                        text_placeholder.markdown(accumulated)
+                        container.error(
+                            f"Could not decline **{display_name}**, so Kai cannot go on: "
+                            f"{e.message}"
+                        )
+                        return accumulated
             elif event.type == "tool-output-error":
                 display_name = tool_names.get(event.tool_call_id, "tool")
                 text_placeholder.markdown(accumulated)
