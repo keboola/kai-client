@@ -446,7 +446,9 @@ class KaiClient:
         Send a message and stream the response.
 
         This method sends a user message to an existing or new chat and yields
-        SSE events as they arrive from the server.
+        SSE events as they arrive from the server. On kai-agent it asks for
+        tool-approval-request events, which announce a tool that waits for
+        submit_approval().
 
         Args:
             chat_id: The chat session ID (use new_chat_id() to create one).
@@ -487,6 +489,11 @@ class KaiClient:
             selected_chat_model="chat-model",
             selected_visibility_type=_normalize_visibility(visibility),
             branch_id=branch_id,
+            # kai-agent then announces a tool that waits for approval with a
+            # tool-approval-request event; kai-assistant has its own flow.
+            supports_approval_requested_event=(
+                None if self.backend is KaiBackend.ASSISTANT else True
+            ),
         )
 
         # Serialize with aliases

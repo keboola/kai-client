@@ -1,16 +1,18 @@
 # SSE Event Types for JavaScript Integration
 
-The kai-assistant API streams responses as Server-Sent Events. This reference covers how each event type maps to frontend UI actions.
+The kai-agent API streams responses as Server-Sent Events. This reference covers how each event type maps to frontend UI actions.
 
 ## SSE Format
 
 Kai uses **data-only SSE** — no `event:` lines. The event type is inside the JSON payload:
 
 ```
-data: {"type":"text-delta","id":"0","delta":"Hello "}
-data: {"type":"start-step"}
-data: {"type":"tool-call","toolCallId":"uuid","toolName":"get_tables","state":"input-available"}
-data: {"type":"finish","finishReason":"stop"}
+data: {"type":"start","messageId":"uuid"}
+data: {"type":"text-delta","id":"text-1","delta":"Hello "}
+data: {"type":"tool-input-start","toolCallId":"toolu_1","toolName":"get_tables"}
+data: {"type":"tool-input-available","toolCallId":"toolu_1","toolName":"get_tables","input":{}}
+data: {"type":"tool-output-available","toolCallId":"toolu_1","output":"..."}
+data: {"type":"finish"}
 data: [DONE]
 ```
 
@@ -19,62 +21,68 @@ data: [DONE]
 | Event Type | Key Fields | Frontend Action |
 |------------|------------|-----------------|
 | `start` | `messageId` | Ignore (internal) |
-| `start-step` | — | Ignore (internal processing boundary) |
 | `text-start` | `id` | Ignore (text block starting) |
 | `text-delta` | `id`, `delta` | Append `delta` to accumulated text, update UI |
 | `text-end` | `id` | Ignore (text block complete) |
-| `tool-call` | `toolCallId`, `toolName`, `state` | Show inline tool status |
-| `tool-approval-request` | `approvalId`, `toolCallId` | Show Approve/Deny buttons |
-| `finish-step` | — | Ignore (step boundary) |
-| `finish` | `finishReason` | Streaming complete, finalize UI |
-| `error` | `message`, `code` | Show error to user |
+| `reasoning-start` / `reasoning-delta` / `reasoning-end` | `id`, `delta` | Ignore, or show as "thinking" |
+| `tool-input-start` | `toolCallId`, `toolName` | Cache `toolName` by `toolCallId` |
+| `tool-input-available` | `toolCallId`, `toolName`, `input` | Show "Calling **toolName**..." |
+| `tool-approval-request` | `toolCallId`, `approvalId` | Show Approve/Deny; the stream stays open |
+| `tool-output-available` | `toolCallId`, `output` | Show "**toolName** completed." |
+| `tool-output-error` | `toolCallId`, `errorText` | Show the tool failure |
+| `data-*` (e.g. `data-usage`, `data-status`) | `data` | Ignore |
+| `finish` | — | Turn complete, sent once; a stream that ends without it was cut off |
+| `error` | `errorText` | Show error to user |
 | `[DONE]` | — | Raw SSE terminator, not JSON |
 
-## Tool Call States
+## Gotcha: toolName only on the input events
 
-The `tool-call` event arrives multiple times with different `state` values:
-
-1. **`started`** — Tool invocation beginning. Usually ignore in UI.
-2. **`input-available`** — Parameters ready. Show "Calling **toolName**..." and cache `toolName` by `toolCallId`.
-3. **`output-available`** — Tool completed. Show "**toolName** completed." Note: `toolName` is often `null` in this event — look it up from the cache.
-
-## Gotcha: toolName is null on output-available
-
-The `output-available` event frequently has `toolName: null`. Track names by `toolCallId`:
+`tool-output-available` and `tool-output-error` carry only `toolCallId`. Track names by it:
 
 ```javascript
 const toolNames = {};
 
-if (type === "tool-call") {
-  const { toolCallId, toolName, state } = data;
-  if (toolName) toolNames[toolCallId] = toolName;
-  const displayName = toolName || toolNames[toolCallId] || "tool";
-
-  if (state === "input-available") showCalling(displayName);
-  if (state === "output-available") showCompleted(displayName);
+switch (type) {
+  case "tool-input-start":
+    toolNames[data.toolCallId] = data.toolName;
+    break;
+  case "tool-input-available":
+    showCalling(data.toolName);
+    break;
+  case "tool-output-available":
+    showCompleted(toolNames[data.toolCallId] || "tool");
+    break;
 }
 ```
 
 ## Tool Approval Request
 
-When Kai calls a write operation, streaming pauses and emits:
+When a tool needs the user's decision, kai-agent emits (only if the chat request set
+`supportsApprovalRequestedEvent: true`):
 
 ```json
 {
   "type": "tool-approval-request",
-  "approvalId": "uuid",
-  "toolCallId": "uuid"
+  "toolCallId": "toolu_1",
+  "approvalId": "toolu_1"
 }
 ```
 
-Send an approval response via `POST /api/chat` with a `tool-approval-response` message part to resume.
+The stream **stays open** and blocked. Send the decision with a separate, non-streaming request
+through your backend to `POST {kai}/api/chat/{chatId}/approval`:
 
-> **kai-assistant only.** `tool-approval-request` / `tool-approval-response` is a
-> Vercel-AI-SDK-v6 protocol that the modern `kai-agent` backend does not
-> implement — which is why this skill discovers `kai-assistant`. On `kai-agent`
-> the stream stays open and blocked instead, and the decision is POSTed to a
-> separate approval endpoint; see the `kai-cli` skill's
-> `references/api-details.md`.
+```json
+{ "toolUseId": "toolu_1", "approved": false, "reason": "User denied" }
+```
+
+The original stream then continues with `tool-output-available` (or `tool-output-error`) and
+the rest of the answer. The POST answers 404 while the approval is not registered yet
+(retry once: kai-agent already waits 10 s for it), and 409 once it can no longer apply
+(final). An undecided write is denied after 5 minutes, and its `tool-output-*` event follows.
+
+Questions (`AskUserQuestion`) and plan cards (`ExitPlanMode`) arrive the same way but never
+time out; the reference example disallows them with
+`toolRestrictions: { disallowedTools: ["AskUserQuestion", "ExitPlanMode"] }`.
 
 ## Next Actions
 
@@ -102,17 +110,21 @@ for (const { type, data } of parseSSEChunk(chunk)) {
       accumulated += data.delta;
       content.innerHTML = renderMarkdown(accumulated) + "▌";
       break;
-    case "tool-call":
-      // Handle tool states (see above)
+    case "tool-input-start":
+    case "tool-input-available":
+    case "tool-output-available":
+    case "tool-output-error":
+      // Handle tool progress (see above)
       break;
     case "tool-approval-request":
-      pendingApproval = { approvalId: data.approvalId, toolCallId: data.toolCallId };
+      pendingApprovals.push({ chatId, toolCallId: data.toolCallId });
       break;
     case "error":
-      showError(data.message);
+      showError(data.errorText);
       break;
     case "finish":
-      break; // Stream complete
+      finished = true; // Sent once at the end of the turn
+      break;
   }
 }
 ```

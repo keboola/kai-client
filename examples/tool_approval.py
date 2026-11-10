@@ -5,6 +5,10 @@ Example demonstrating tool approval flow for write operations.
 When the AI assistant calls tools that modify data (create_config, run_job, etc.),
 those tools require explicit approval before execution. This example shows how to:
 
+It uses the legacy kai-assistant approval flow (see main()); on kai-agent a tool
+that waits for approval sends a tool-approval-request event instead, answered with
+submit_approval() inside the same stream (see the README).
+
 1. Detect when a tool requires approval (state="input-available" without immediate output)
 2. Approve or deny the tool execution
 3. Continue streaming the response after approval

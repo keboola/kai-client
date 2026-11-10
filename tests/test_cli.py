@@ -27,6 +27,7 @@ from kai_client.models import (
     Message,
     PingResponse,
     TextEvent,
+    ToolApprovalRequestEvent,
     ToolCallEvent,
     Vote,
 )
@@ -36,6 +37,13 @@ from kai_client.models import (
 def runner():
     """Create a CLI runner."""
     return CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def isolate_kai_env(monkeypatch):
+    """Keep Data App Kai env vars of the host from leaking into the tests."""
+    monkeypatch.delenv("KAI_STORAGE_API_TOKEN", raising=False)
+    monkeypatch.delenv("KAI_ENABLED", raising=False)
 
 
 @pytest.fixture
@@ -172,6 +180,94 @@ class TestGetClient:
             mock_factory.return_value = AsyncMock()
             await get_client(ctx)
             assert mock_factory.call_args.kwargs["workspace_id"] == "ws-2"
+
+    @pytest.mark.asyncio
+    async def test_get_client_prefers_kai_token_env(self, mock_env, monkeypatch):
+        monkeypatch.setenv("KAI_STORAGE_API_TOKEN", "kai-token")
+        ctx = SimpleNamespace(
+            obj={"token": None, "url": None, "base_url": "http://localhost:4000"}
+        )
+        client = await get_client(ctx)
+        assert client.storage_api_token == "kai-token"
+
+    @pytest.mark.asyncio
+    async def test_get_client_falls_back_to_storage_api_token(self, mock_env):
+        ctx = SimpleNamespace(
+            obj={"token": None, "url": None, "base_url": "http://localhost:4000"}
+        )
+        client = await get_client(ctx)
+        assert client.storage_api_token == "test-token"
+
+    @pytest.mark.asyncio
+    async def test_get_client_explicit_token_wins(self, mock_env, monkeypatch):
+        monkeypatch.setenv("KAI_ENABLED", "1")
+        monkeypatch.setenv("KAI_STORAGE_API_TOKEN", "kai-token")
+        ctx = SimpleNamespace(
+            obj={"token": "explicit", "url": None, "base_url": "http://localhost:4000"}
+        )
+        client = await get_client(ctx)
+        assert client.storage_api_token == "explicit"
+
+    @pytest.mark.asyncio
+    async def test_get_client_kai_enabled_without_kai_token_exits(
+        self, mock_env, monkeypatch, capsys
+    ):
+        monkeypatch.setenv("KAI_ENABLED", "1")
+        ctx = SimpleNamespace(
+            obj={"token": None, "url": None, "base_url": "http://localhost:4000"}
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            await get_client(ctx)
+        assert exc_info.value.code == 1
+        err = capsys.readouterr().err
+        assert "KAI_STORAGE_API_TOKEN is missing" in err
+        assert "Redeploy" in err
+
+
+class TestTokenFromEnv:
+    """The CLI resolves the token from env through resolve_storage_api_token()."""
+
+    def _invoke_ping(self, runner, args=None):
+        with patch("kai_client.cli.KaiClient.from_storage_api") as mock_factory:
+            mock_client = AsyncMock()
+            mock_client.ping = AsyncMock(
+                return_value=PingResponse(timestamp="2025-01-01T00:00:00Z")
+            )
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_factory.return_value = mock_client
+            result = runner.invoke(main, [*(args or []), "ping"])
+        return result, mock_factory
+
+    def test_kai_token_wins_over_storage_api_token(self, runner, mock_env, monkeypatch):
+        monkeypatch.setenv("KAI_STORAGE_API_TOKEN", "kai-token")
+        result, mock_factory = self._invoke_ping(runner)
+        assert result.exit_code == 0
+        assert mock_factory.call_args.kwargs["storage_api_token"] == "kai-token"
+
+    def test_storage_api_token_used_without_kai_env(self, runner, mock_env):
+        result, mock_factory = self._invoke_ping(runner)
+        assert result.exit_code == 0
+        assert mock_factory.call_args.kwargs["storage_api_token"] == "test-token"
+
+    def test_token_option_wins_over_kai_token(self, runner, mock_env, monkeypatch):
+        monkeypatch.setenv("KAI_STORAGE_API_TOKEN", "kai-token")
+        result, mock_factory = self._invoke_ping(runner, ["--token", "explicit"])
+        assert result.exit_code == 0
+        assert mock_factory.call_args.kwargs["storage_api_token"] == "explicit"
+
+    def test_token_option_wins_when_kai_enabled(self, runner, mock_env, monkeypatch):
+        monkeypatch.setenv("KAI_ENABLED", "1")
+        result, mock_factory = self._invoke_ping(runner, ["--token", "explicit"])
+        assert result.exit_code == 0
+        assert mock_factory.call_args.kwargs["storage_api_token"] == "explicit"
+
+    def test_kai_enabled_without_kai_token_fails(self, runner, mock_env, monkeypatch):
+        monkeypatch.setenv("KAI_ENABLED", "1")
+        result, mock_factory = self._invoke_ping(runner)
+        assert result.exit_code == 1
+        assert "KAI_STORAGE_API_TOKEN is missing" in result.output
+        mock_factory.assert_not_called()
 
 
 class TestPingCommand:
@@ -588,6 +684,11 @@ class TestChatApprovalFlowSelection:
                 state="input-available",
                 input={"name": "test"},
             )
+            yield ToolApprovalRequestEvent(
+                type="tool-approval-request",
+                toolCallId="tool-123",
+                approvalId="tool-123",
+            )
             # Reaching here proves the approval was submitted while this same
             # stream was still open (the kai-agent contract).
             order.append(("stream-resumed", mock_client.submit_approval.await_count))
@@ -746,7 +847,7 @@ class TestChatApprovalFlowSelection:
             # stdout to simulate a terminal — a harness artifact, not something
             # the CLI writes (verified against a real piped subprocess).
             lines = [ln for ln in result.stdout.splitlines() if ln.startswith("{")]
-            assert len(lines) == 4, f"expected 4 event lines, got {result.stdout!r}"
+            assert len(lines) == 5, f"expected 5 event lines, got {result.stdout!r}"
             for line in lines:
                 json.loads(line)
             mock_client.submit_approval.assert_awaited_once_with(
